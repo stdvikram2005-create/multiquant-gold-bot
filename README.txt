@@ -13,3 +13,4 @@ Important:
 - Only 5M, 15M, 30M, 1H and 4H signal timeframes.
 - Normal ticker updates do NOT write to Durable Objects SQLite.
 - SQLite writes happen for actual TP/close events and normal state/signal events.
+Fresh Gold Bot Deployment
