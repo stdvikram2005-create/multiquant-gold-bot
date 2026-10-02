@@ -8,14 +8,17 @@ const CFG = {
   OKX_BUSINESS_WS_URL: "wss://ws.okx.com/ws/v5/business",
   OKX_INST_ID: "XAU-USDT-SWAP",
   MAX_OPEN_POSITIONS: 5,
+  // 5M is execution/entry timing only. Signals are generated from 15M+ structure.
   TIMEFRAMES: [
-    { key: "5M", channel: "candle5m", bar: "5m", history: 180 },
-    { key: "15M", channel: "candle15m", bar: "15m", history: 160 },
-    { key: "30M", channel: "candle30m", bar: "30m", history: 140 },
-    { key: "1H", channel: "candle1H", bar: "1H", history: 130 },
-    { key: "4H", channel: "candle4H", bar: "4H", history: 110 }
+    { key: "5M", channel: "candle5m", bar: "5m", history: 180, signal: false },
+    { key: "15M", channel: "candle15m", bar: "15m", history: 160, signal: true },
+    { key: "30M", channel: "candle30m", bar: "30m", history: 140, signal: true },
+    { key: "1H", channel: "candle1H", bar: "1H", history: 130, signal: true },
+    { key: "4H", channel: "candle4H", bar: "4H", history: 110, signal: true }
   ]
 };
+
+const SIGNAL_TIMEFRAMES = CFG.TIMEFRAMES.filter(x => x.signal);
 
 const TF = Object.fromEntries(CFG.TIMEFRAMES.map(x => [x.key, x]));
 
@@ -344,7 +347,7 @@ export class GoldEngine extends DurableObject {
       // OKX can send many updates per second for the same live candle. Evaluating
       // every update can create repeated signals as the live price/entry moves.
       // Position monitoring remains tick-driven separately.
-      if (candle.confirm === 1) {
+      if (candle.confirm === 1 && tf.signal) {
         const lastEvaluated = Number(this.lastEvaluatedCandleTs.get(tf.key) || 0);
         if (candle.ts !== lastEvaluated) {
           // Persist the candle evaluation marker BEFORE starting async signal work.
@@ -396,7 +399,7 @@ export class GoldEngine extends DurableObject {
     }
     if (url.pathname === "/test") {
       const results = [];
-      for (const tf of CFG.TIMEFRAMES) {
+      for (const tf of SIGNAL_TIMEFRAMES) {
         const s = await this.evaluateSignalForTimeframe(tf.key, true);
         results.push({ timeframe: tf.key, signal: !!s });
       }
@@ -421,7 +424,7 @@ export class GoldEngine extends DurableObject {
     if (text === "/monthly") return this.sendReport(chatId, 31, true);
     if (text === "/goldtest") {
       const results = [];
-      for (const tf of CFG.TIMEFRAMES) {
+      for (const tf of SIGNAL_TIMEFRAMES) {
         const s = await this.evaluateSignalForTimeframe(tf.key, true);
         if (s) results.push(`${tf.key} ${s.direction} ${s.setup}`);
       }
@@ -737,14 +740,12 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   if (setup.confirmedBreak) score += 8;
   if (timeframe === "1H") score += 3;
   if (timeframe === "4H") score += 5;
-  if (timeframe === "5M") score -= 2;
-
   if (score < 68) return null;
 
   const recentLow = Math.min(...lows.slice(-15));
   const recentHigh = Math.max(...highs.slice(-15));
   const buffer = Math.max(0.35, atrv * 0.12);
-  const zoneFactor = { "5M": 0.18, "15M": 0.22, "30M": 0.26, "1H": 0.30, "4H": 0.34 }[timeframe] || 0.22;
+  const zoneFactor = { "15M": 0.22, "30M": 0.26, "1H": 0.30, "4H": 0.34 }[timeframe] || 0.22;
   const zoneWidth = clamp(atrv * zoneFactor, 0.60, 3.50);
 
   let center = Number(setup.anchor || price);
@@ -787,7 +788,7 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   const patternFactor = setup.type === "FLAG" || setup.type === "PENNANT" ? 1.12 :
     setup.type === "TRIANGLE" || setup.type === "WEDGE" ? 1.08 :
     setup.type === "BREAKOUT" ? 1.06 : 1.00;
-  const tfFactor = { "5M": 0.92, "15M": 1.00, "30M": 1.06, "1H": 1.12, "4H": 1.18 }[timeframe] || 1;
+  const tfFactor = { "15M": 1.00, "30M": 1.06, "1H": 1.12, "4H": 1.18 }[timeframe] || 1;
 
   const tp1Dist = clamp(Math.max(8, risk * (1.00 + 0.20 * quality) * patternFactor * tfFactor), 8, 12);
   const tp2Dist = clamp(Math.max(15, risk * (1.75 + 0.45 * quality) * patternFactor * tfFactor), 15, 24);
@@ -825,7 +826,7 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
 }
 
 function getHigherTimeframeBias(allCandles, timeframe) {
-  const order = ["5M", "15M", "30M", "1H", "4H"];
+  const order = ["15M", "30M", "1H", "4H"];
   const idx = order.indexOf(timeframe);
   if (idx < 0) return null;
   const higher = order.slice(idx + 1);
@@ -982,7 +983,7 @@ function fmt(v) { const n = Number(v); return Number.isFinite(n) && n > 0 ? n.to
 function fmtDate(v) { try { return new Date(v).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }); } catch (_) { return String(v || "N/A"); } }
 
 function formatSignal(s) {
-  return `🥇 GOLD SIGNAL\n\n${s.direction === "LONG" ? "🟢 BUY GOLD" : "🔴 SELL GOLD"}\n\n📍 Entry Zone: ${s.entry}\n\n🛑 SL: ${s.sl}\n\n🎯 TP1: ${s.tp1}\n🎯 TP2: ${s.tp2}\n🎯 TP3: ${s.tp3}\n\n📊 Setup: ${s.setup} — ${s.timeframe}`;
+  return `🥇 GOLD SIGNAL\n\n${s.direction === "LONG" ? "🟢 BUY GOLD" : "🔴 SELL GOLD"}\n\n📍 Entry Zone: ${s.entry}\n\n🛑 SL: ${s.sl}\n\n🎯 TP1: ${s.tp1}\n🎯 TP2: ${s.tp2}\n🎯 TP3: ${s.tp3}\n\n📊 Setup: ${s.setup} — ${s.timeframe}\n\n#XAUUSD #XAUUSDT #Gold #Forex`;
 }
 
 async function sendChannel(env, text) { return tg(env, "sendMessage", { chat_id: env.CHANNEL_CHAT_ID || CFG.CHANNEL_CHAT_ID, text, disable_web_page_preview: true }); }
