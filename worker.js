@@ -1290,17 +1290,70 @@ function escapeMarkdown(v) {
 
 async function sendChannel(env, text) { return tg(env, "sendMessage", { chat_id: env.CHANNEL_CHAT_ID || CFG.CHANNEL_CHAT_ID, text, disable_web_page_preview: true }); }
 async function sendReply(env, text, id) { return tg(env, "sendMessage", { chat_id: env.CHANNEL_CHAT_ID || CFG.CHANNEL_CHAT_ID, text, reply_to_message_id: Number(id), allow_sending_without_reply: true, disable_web_page_preview: true }); }
+
+// Telegram safety queue: serialize outbound requests in the current Worker isolate,
+// keep a small gap between messages, and honor Telegram's retry_after on HTTP 429.
+// This prevents a burst of TP/SL/report notifications from turning into a retry storm.
+let telegramQueue = Promise.resolve();
+let telegramNextAt = 0;
+
+function enqueueTelegram(task) {
+  const run = telegramQueue.then(task, task);
+  telegramQueue = run.catch(() => null);
+  return run;
+}
+
 async function tg(env, method, body) {
   if (!env.TELEGRAM_BOT_TOKEN) return null;
-  try {
-    const payload = method === "sendMessage" ? { ...body, parse_mode: body?.parse_mode || "Markdown" } : body;
-    const r = await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/" + method, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload)
-    });
-    const p = await r.json();
-    if (!r.ok) { console.error("TELEGRAM ERROR", method, r.status, p); return null; }
-    return p.result || p;
-  } catch (e) { console.error("TELEGRAM FETCH ERROR", e); return null; }
+  return enqueueTelegram(async () => {
+    const payload = method === "sendMessage"
+      ? { ...body, parse_mode: body?.parse_mode || "Markdown" }
+      : body;
+
+    const maxAttempts = 4;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const wait = Math.max(0, telegramNextAt - Date.now());
+        if (wait > 0) await sleep(wait);
+
+        const r = await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/" + method, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        const p = await r.json();
+
+        if (r.ok) {
+          // Keep messages gently spaced even when Telegram accepts them quickly.
+          telegramNextAt = Date.now() + 350;
+          return p.result || p;
+        }
+
+        if (r.status === 429) {
+          const retryAfter = Math.max(1, Number(p?.parameters?.retry_after || 3));
+          console.error("TELEGRAM RATE LIMIT", method, "retry_after=" + retryAfter + "s", "attempt=" + attempt);
+          telegramNextAt = Date.now() + retryAfter * 1000 + 250;
+          if (attempt < maxAttempts) {
+            await sleep(retryAfter * 1000 + 250);
+            continue;
+          }
+        }
+
+        console.error("TELEGRAM ERROR", method, r.status, p);
+        return null;
+      } catch (e) {
+        console.error("TELEGRAM FETCH ERROR", method, e);
+        if (attempt < maxAttempts) {
+          telegramNextAt = Date.now() + 1000;
+          await sleep(1000);
+          continue;
+        }
+        return null;
+      }
+    }
+    return null;
+  });
 }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function json(x) { return new Response(JSON.stringify(x), { headers: { "content-type": "application/json" } }); }
