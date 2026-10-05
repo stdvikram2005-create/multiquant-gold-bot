@@ -657,7 +657,6 @@ export class GoldEngine extends DurableObject {
       for (const hit of reached) await this.sendTpHit(pos, hit);
     }
   }
-  }
 
   async sendTpHit(pos, hit) {
     const entry = Number(pos.entry_mid);
