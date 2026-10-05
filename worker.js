@@ -344,8 +344,9 @@ export class GoldEngine extends DurableObject {
     for (const x of m.data) {
       const candle = parseCandle(x);
       if (!(candle.c > 0)) continue;
-      this.lastOkxPrice = candle.c;
-      this.lastPrice = toCommunityPrice(candle.c);
+      // Candle closes are for strategy/candle structure only.
+      // Keep lastOkxPrice owned by the public ticker so signal entry uses
+      // the actual live OKX XAU-USDT-SWAP last price at signal time.
       const arr = this.candles[tf.key] || (this.candles[tf.key] = []);
       const idx = arr.findIndex(c => c.ts === candle.ts);
       if (idx >= 0) arr[idx] = candle;
@@ -781,18 +782,14 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   const zoneFactor = { "15M": 0.22, "30M": 0.26, "1H": 0.30, "4H": 0.34 }[timeframe] || 0.22;
   const zoneWidth = clamp(atrv * zoneFactor, 0.60, 3.50);
 
-  let center = Number(setup.anchor || price);
-  if (!(center > 0)) center = price;
-  center = clamp(center, price - atrv * 0.9, price + atrv * 0.9);
-
-  let entryLow = center - zoneWidth / 2;
-  let entryHigh = center + zoneWidth / 2;
-
-  // For continuation/breakout setups, do not put the zone too far behind price.
-  if (setup.confirmedBreak) {
-    if (direction === "LONG") entryLow = Math.max(entryLow, price - atrv * 0.35);
-    else entryHigh = Math.min(entryHigh, price + atrv * 0.35);
-  }
+  // PRICE REFERENCE FIX:
+  // Keep all technical setup/pattern/EMA/RSI/score logic unchanged, but make
+  // the live OKX ticker price the exact entry-zone center. This means entryMid
+  // is the actual XAU-USDT-SWAP last price at signal time. applyCommunityPrice()
+  // then applies the fixed -3.88 offset exactly once to the final signal.
+  const center = price;
+  const entryLow = center - zoneWidth / 2;
+  const entryHigh = center + zoneWidth / 2;
 
   let sl;
   if (direction === "LONG") {
@@ -801,9 +798,9 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
     sl = Math.max(Number(setup.stopAnchor || recentHigh) + buffer, entryHigh + buffer);
   }
 
-  entryLow = Math.max(0.01, entryLow);
-  entryHigh = Math.max(entryLow, entryHigh);
-  const entryMid = (entryLow + entryHigh) / 2;
+  const safeEntryLow = Math.max(0.01, entryLow);
+  const safeEntryHigh = Math.max(safeEntryLow, entryHigh);
+  const entryMid = price;
 
   // Dynamic risk: structural SL first, ATR guard second.
   let risk = Math.abs(entryMid - sl);
@@ -824,15 +821,15 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   const tp1 = direction === "LONG" ? entryMid + tp1Dist : entryMid - tp1Dist;
   const tp2 = direction === "LONG" ? entryMid + tp2Dist : entryMid - tp2Dist;
   const tp3 = direction === "LONG" ? entryMid + tp3Dist : entryMid - tp3Dist;
-  if (direction === "LONG" && !(sl < entryLow && tp1 < tp2 && tp2 < tp3)) return null;
-  if (direction === "SHORT" && !(sl > entryHigh && tp1 > tp2 && tp2 > tp3)) return null;
+  if (direction === "LONG" && !(sl < safeEntryLow && tp1 < tp2 && tp2 < tp3)) return null;
+  if (direction === "SHORT" && !(sl > safeEntryHigh && tp1 > tp2 && tp2 > tp3)) return null;
 
   return {
     direction,
-    entryLow,
-    entryHigh,
+    entryLow: safeEntryLow,
+    entryHigh: safeEntryHigh,
     entryMid,
-    entry: `${fmt(entryLow)} – ${fmt(entryHigh)}`,
+    entry: `${fmt(safeEntryLow)} – ${fmt(safeEntryHigh)}`,
     slPrice: sl,
     sl: fmt(sl),
     tp1Price: tp1,
