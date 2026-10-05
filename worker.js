@@ -10,13 +10,18 @@ const CFG = {
   MAX_OPEN_POSITIONS: 5,
   // Fixed community/MT5 reference conversion: Community Price = OKX Price - 3.88
   GOLD_PRICE_OFFSET: -3.88,
-  TP1_POINTS: 8,
-  TP2_POINTS: 15,
-  TP3_POINTS: 25,
+  TP1_POINTS: 7,
+  TP2_POINTS: 13,
+  TP3_POINTS: 22,
+  TP1_POINTS_5M: 5,
+  TP2_POINTS_5M: 8,
+  TP3_POINTS_5M: 13,
   REVERSAL_MIN_FAVORABLE_POINTS: 5,
-  // 5M is execution/entry timing only. Signals are generated from 15M+ structure.
+  REVERSAL_GAP_5M: 3,
+  REVERSAL_GAP_LARGE_TF: 5,
+  // 5M is now an active signal timeframe. Strategy logic remains unchanged.
   TIMEFRAMES: [
-    { key: "5M", channel: "candle5m", bar: "5m", history: 180, signal: false },
+    { key: "5M", channel: "candle5m", bar: "5m", history: 180, signal: true },
     { key: "15M", channel: "candle15m", bar: "15m", history: 160, signal: true },
     { key: "30M", channel: "candle30m", bar: "30m", history: 140, signal: true },
     { key: "1H", channel: "candle1H", bar: "1H", history: 130, signal: true },
@@ -344,9 +349,8 @@ export class GoldEngine extends DurableObject {
     for (const x of m.data) {
       const candle = parseCandle(x);
       if (!(candle.c > 0)) continue;
-      // Candle closes are for strategy/candle structure only.
-      // Keep lastOkxPrice owned by the public ticker so signal entry uses
-      // the actual live OKX XAU-USDT-SWAP last price at signal time.
+      this.lastOkxPrice = candle.c;
+      this.lastPrice = toCommunityPrice(candle.c);
       const arr = this.candles[tf.key] || (this.candles[tf.key] = []);
       const idx = arr.findIndex(c => c.ts === candle.ts);
       if (idx >= 0) arr[idx] = candle;
@@ -557,32 +561,24 @@ export class GoldEngine extends DurableObject {
 
       const sl = Number(pos.sl_price);
       const slTouched = direction === "LONG" ? price <= sl : price >= sl;
+      const entry = Number(pos.entry_mid);
       const peakPoints = direction === "LONG"
-        ? high - Number(pos.entry_mid)
-        : Number(pos.entry_mid) - low;
+        ? high - entry
+        : entry - low;
       const favorableEnough = peakPoints >= CFG.REVERSAL_MIN_FAVORABLE_POINTS;
+      const reversalGap = pos.timeframe === "5M" ? CFG.REVERSAL_GAP_5M : CFG.REVERSAL_GAP_LARGE_TF;
 
-      // Preserve the old protection idea, but report the final close from the
-      // best favorable/reversal price whenever the trade has moved >=5 points.
-      let effectiveStop = sl;
-      if (tp1 || tp2) effectiveStop = Number(pos.entry_mid);
-      if (tp3) {
-        if (direction === "LONG" && high > Number(pos.entry_mid)) {
-          effectiveStop = Number(pos.entry_mid) + (high - Number(pos.entry_mid)) * 0.80;
-        }
-        if (direction === "SHORT" && low < Number(pos.entry_mid)) {
-          effectiveStop = Number(pos.entry_mid) - (Number(pos.entry_mid) - low) * 0.80;
-        }
-      }
+      // New MFE protection: once the position has moved at least +5 points
+      // in its favor, a reversal of the timeframe-specific gap closes it.
+      // TP1 is NOT required for this protection to activate.
+      const mfeReversalClose = favorableEnough && (direction === "LONG"
+        ? price <= high - reversalGap
+        : price >= low + reversalGap);
 
-      const protectedClose = (tp1 || tp2) && (direction === "LONG" ? price <= effectiveStop : price >= effectiveStop);
-      const trailingClose = tp3 && (direction === "LONG" ? price <= effectiveStop : price >= effectiveStop);
-
-      // Direct SL = original SL is hit before any 5-point favorable move.
-      // Any close after a >=5 point favorable move is a reversal/protected close.
-      const directSl = !tp1 && !tp2 && !tp3 && slTouched && !favorableEnough;
-      const reversalClose = (slTouched && favorableEnough) || protectedClose || trailingClose;
-      const shouldClose = directSl || reversalClose;
+      // Preserve the existing SL rule: before a +5 point favorable move,
+      // only the original SL can directly close the trade.
+      const directSl = !favorableEnough && slTouched;
+      const shouldClose = directSl || mfeReversalClose;
 
       if (!reached.length && !shouldClose) continue;
 
@@ -644,82 +640,193 @@ export class GoldEngine extends DurableObject {
 
   async sendPositions(chatId) {
     const rows = this.ctx.storage.sql.exec("SELECT * FROM gold_positions WHERE status='OPEN' ORDER BY id ASC").toArray();
-    if (!rows.length) return this.sendText(chatId, "🥇 LIVE GOLD POSITIONS\n\nNo open gold position.");
+    if (!rows.length) {
+      return this.sendText(chatId, `🥇 **LIVE GOLD POSITIONS**\n\n━━━━━━━━━━━━━━━━━━━━\n\n📊 **SUMMARY**\n\nOpen Positions : **0**\n\n━━━━━━━━━━━━━━━━━━━━\n\n_No open gold position right now._`);
+    }
 
-    const chunks = [];
     const price = Number(this.lastPrice || 0);
-    const totalMove = rows.reduce((sum, p) => {
-      const move = p.direction === "LONG" ? price - Number(p.entry_mid) : Number(p.entry_mid) - price;
-      return sum + move;
-    }, 0);
+    const moves = rows.map(p => p.direction === "LONG" ? price - Number(p.entry_mid) : Number(p.entry_mid) - price);
+    const totalMove = moves.reduce((sum, move) => sum + move, 0);
     const buys = rows.filter(p => p.direction === "LONG").length;
     const sells = rows.filter(p => p.direction === "SHORT").length;
-    const tp1Hits = rows.filter(p => p.tp1_hit).length;
-    const tp2Hits = rows.filter(p => p.tp2_hit).length;
-    const tp3Hits = rows.filter(p => p.tp3_hit).length;
+    const inProfit = moves.filter(x => x > 0).length;
+    const inLoss = moves.filter(x => x < 0).length;
+    const flat = moves.filter(x => x === 0).length;
+    const tp1Hits = rows.filter(p => Number(p.tp1_hit) === 1).length;
+    const tp2Hits = rows.filter(p => Number(p.tp2_hit) === 1).length;
+    const tp3Hits = rows.filter(p => Number(p.tp3_hit) === 1).length;
+
     const summary = [
-      `🥇 LIVE GOLD POSITIONS`,
+      `🥇 **LIVE GOLD POSITIONS**`,
       `━━━━━━━━━━━━━━━━━━━━`,
-      `📊 SUMMARY`,
-      `Open Positions : ${rows.length}`,
-      `🟢 BUY          : ${buys}`,
-      `🔴 SELL         : ${sells}`,
-      `💰 TOTAL P/L   : ${totalMove >= 0 ? "+" : ""}${totalMove.toFixed(1)} Points`,
-      `📈 TOTAL P/L   : ${totalMove >= 0 ? "+" : ""}${(totalMove * 10).toFixed(0)} Pips`,
-      `🎯 TP1 Hits    : ${tp1Hits}`,
-      `🎯 TP2 Hits    : ${tp2Hits}`,
-      `🎯 TP3 Hits    : ${tp3Hits}`,
-      `💵 Current     : ${fmt(price)}`,
+      ``,
+      `📊 **SUMMARY**`,
+      ``,
+      `Open Positions : **${rows.length}**`,
+      `🟢 BUY         : **${buys}**`,
+      `🔴 SELL        : **${sells}**`,
+      ``,
+      `📈 In Profit   : **${inProfit}**`,
+      `📉 In Loss     : **${inLoss}**`,
+      `⏳ Flat        : **${flat}**`,
+      ``,
+      `💰 **TOTAL P/L : ${signedPoints(totalMove)} Points**`,
+      ``,
+      `🎯 TP1 Hit     : **${tp1Hits}**`,
+      `🎯 TP2 Hit     : **${tp2Hits}**`,
+      `🎯 TP3 Hit     : **${tp3Hits}**`,
+      ``,
+      `💵 Current     : **${fmt(price)}**`,
+      ``,
       `━━━━━━━━━━━━━━━━━━━━`,
-      `📌 POSITION DETAILS`
+      `📌 **POSITION DETAILS**`,
+      `━━━━━━━━━━━━━━━━━━━━`
     ];
-    let current = summary;
+
+    const chunks = [];
+    let current = summary.slice();
     const maxChars = 3500;
 
     for (let i = 0; i < rows.length; i++) {
       const p = rows[i];
-      const currentPrice = this.lastPrice;
-      const move = p.direction === "LONG" ? currentPrice - p.entry_mid : p.entry_mid - currentPrice;
+      const currentPrice = price;
+      const move = p.direction === "LONG" ? currentPrice - Number(p.entry_mid) : Number(p.entry_mid) - currentPrice;
+      const directionLabel = p.direction === "LONG" ? "🟢 BUY" : "🔴 SELL";
       const block = [
-        `\n${String(i + 1).padStart(2, "0")} ┃ ${p.direction === "LONG" ? "🟢 BUY" : "🔴 SELL"} GOLD — ${p.timeframe || "Gold"}`,
+        ``,
+        `**${String(i + 1).padStart(2, "0")} ┃ ${directionLabel} GOLD — ${p.timeframe || "Gold"}**`,
         `━━━━━━━━━━━━━━━━━━━━`,
-        `📅 Opened : ${fmtDate(p.opened_at)}`,
-        `📍 Entry  : ${fmt(p.entry_low)} – ${fmt(p.entry_high)}`,
-        `💰 Current: ${fmt(currentPrice)}`,
-        `📊 Move   : ${move >= 0 ? "+" : ""}${move.toFixed(1)} Points`,
-        `📈 Pips   : ${(move * 10 >= 0 ? "+" : "")}${(move * 10).toFixed(0)} Pips`,
-        `🛑 SL     : ${fmt(p.sl_price)}`,
-        `🎯 TP1    : ${fmt(p.tp1_price)}${p.tp1_hit ? " ✅" : ""}`,
-        `🎯 TP2    : ${fmt(p.tp2_price)}${p.tp2_hit ? " ✅" : ""}`,
-        `🎯 TP3    : ${fmt(p.tp3_price)}${p.tp3_hit ? " ✅" : ""}`,
-        `📊 Setup  : ${p.setup || "Gold Setup"}`
+        ``,
+        `📅 Opened  : *${fmtDate(p.opened_at)}*`,
+        ``,
+        `📍 **Entry**   : **${fmt(p.entry_low)} – ${fmt(p.entry_high)}**`,
+        `💰 **Current** : **${fmt(currentPrice)}**`,
+        `📊 **Move**    : **${signedPoints(move)} Points**`,
+        ``,
+        `🛑 **Stop Loss** : **${fmt(p.sl_price)}**`,
+        ``,
+        `🎯 **TP1** : **${fmt(p.tp1_price)}**${p.tp1_hit ? " ✅" : ""}`,
+        `🎯 **TP2** : **${fmt(p.tp2_price)}**${p.tp2_hit ? " ✅" : ""}`,
+        `🎯 **TP3** : **${fmt(p.tp3_price)}**${p.tp3_hit ? " ✅" : ""}`,
+        ``,
+        `📊 *Setup: ${escapeMarkdown(p.setup || "Gold Setup")}*`
       ].join("\n");
-      if ((current.join("\n").length + block.length) > maxChars && current.length > 2) {
+
+      if ((current.join("\n").length + block.length + 20) > maxChars && current.length > 3) {
         chunks.push(current.join("\n"));
-        current = [`🥇 LIVE GOLD POSITIONS — CONTINUED`, `📌 POSITION DETAILS`, `━━━━━━━━━━━━━━━━━━━━`];
+        current = [
+          `🥇 **LIVE GOLD POSITIONS — CONTINUED**`,
+          `━━━━━━━━━━━━━━━━━━━━`,
+          `📌 **POSITION DETAILS**`,
+          `━━━━━━━━━━━━━━━━━━━━`
+        ];
       }
       current.push(block);
     }
-    if (current.length > 2) chunks.push(current.join("\n"));
+    if (current.length) chunks.push(current.join("\n"));
 
     for (let i = 0; i < chunks.length; i++) {
-      await this.sendText(chatId, `${chunks[i]}\n\n📄 ${i + 1}/${chunks.length}`);
+      await this.sendText(chatId, `${chunks[i]}\n\n━━━━━━━━━━━━━━━━━━━━\n📄 *${i + 1}/${chunks.length}*`);
     }
     return null;
   }
 
   async sendReport(chatId, days, calendarMonth = false) {
-    const start = calendarMonth ? new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString() : new Date(Date.now() - days * 86400000).toISOString();
-    const rows = this.ctx.storage.sql.exec("SELECT * FROM gold_positions WHERE closed_at IS NOT NULL AND closed_at >= ? ORDER BY closed_at DESC", start).toArray();
-    const open = this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM gold_positions WHERE status='OPEN'").one();
-    const wins = rows.filter(r => Number(r.realized_points) > 0).length;
-    const losses = rows.filter(r => Number(r.realized_points) < 0).length;
-    const net = rows.reduce((a, r) => a + Number(r.realized_points || 0), 0);
+    const now = new Date();
+    const indiaNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+    const startDate = calendarMonth
+      ? new Date(Date.UTC(indiaNow.getFullYear(), indiaNow.getMonth(), 1) - (5.5 * 60 * 60 * 1000))
+      : new Date(Date.now() - days * 86400000);
+    const start = startDate.toISOString();
+
+    // Signals are counted from signal history, while results are calculated
+    // from the positions generated by those signals. This keeps the report
+    // understandable: "signals sent" is not confused with "closed trades".
+    const signals = this.ctx.storage.sql
+      .exec("SELECT * FROM gold_signal_history WHERE sent_at >= ? ORDER BY sent_at ASC", start)
+      .toArray();
+    const positions = this.ctx.storage.sql
+      .exec("SELECT * FROM gold_positions WHERE opened_at >= ? ORDER BY opened_at ASC", start)
+      .toArray();
+
+    const totalSignals = signals.length;
+    const closed = positions.filter(p => String(p.status) === "CLOSED");
+    const running = positions.filter(p => String(p.status) === "OPEN");
+    const wins = closed.filter(p => Number(p.realized_points) > 0);
+    const losses = closed.filter(p => Number(p.realized_points) < 0);
+    const breakeven = closed.filter(p => Number(p.realized_points) === 0);
+    const grossProfit = wins.reduce((a, p) => a + Number(p.realized_points || 0), 0);
+    const grossLoss = losses.reduce((a, p) => a + Number(p.realized_points || 0), 0);
+    const net = grossProfit + grossLoss + breakeven.reduce((a, p) => a + Number(p.realized_points || 0), 0);
+    const winRate = closed.length ? (wins.length / closed.length) * 100 : 0;
+    const pending = Math.max(0, totalSignals - closed.length - running.length);
     const title = calendarMonth ? "THIS MONTH GOLD REPORT" : "LAST 7 DAYS GOLD REPORT";
-    const lines = [`🥇 ${title}`, "", `Closed: ${rows.length}`, `Open: ${Number(open?.n || 0)}`, `Profitable: ${wins}`, `Losing: ${losses}`,
-      `Win Rate: ${rows.length ? ((wins / rows.length) * 100).toFixed(1) : "0.0"}%`, `Net: ${net >= 0 ? "+" : ""}${net.toFixed(1)} Points`,
-      `Net Pips: ${net >= 0 ? "+" : ""}${(net * 10).toFixed(0)}`, `TP1 Hits: ${rows.filter(r => r.tp1_hit).length}`, `TP2 Hits: ${rows.filter(r => r.tp2_hit).length}`,
-      `TP3 Hits: ${rows.filter(r => r.tp3_hit).length}`, `Direct SL: ${rows.filter(r => r.close_reason === "Direct SL").length}`, `Protected Exit: ${rows.filter(r => r.close_reason === "Protected Exit").length}`];
+    const periodLabel = calendarMonth
+      ? `${fmtDate(startDate).split(",")[0]} – ${fmtDate(new Date()).split(",")[0]}`
+      : `${fmtDate(startDate).split(",")[0]} – ${fmtDate(new Date()).split(",")[0]}`;
+
+    const timeframeOrder = ["5M", "15M", "30M", "1H", "4H"];
+    const tfLines = timeframeOrder.map(tf => {
+      const count = signals.filter(s => String(s.timeframe) === tf).length;
+      return `${tf.padEnd(5, " ")} : **${count} Signals**`;
+    }).filter((_, i) => signals.some(s => String(s.timeframe) === timeframeOrder[i]));
+
+    const lines = [
+      `🥇 **${title}**`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `📅 **PERIOD**`,
+      `*${periodLabel}*`,
+      ``,
+      `📊 **SIGNAL SUMMARY**`,
+      ``,
+      `Total Signals : **${totalSignals}**`,
+      `Closed        : **${closed.length}**`,
+      `Running       : **${running.length}**`,
+      ...(pending ? [`Pending       : **${pending}**`] : []),
+      ``,
+      `🟢 Profitable : **${wins.length}**`,
+      `🔴 Losing     : **${losses.length}**`,
+      `⚪ Break-even : **${breakeven.length}**`,
+      ``,
+      `📈 **Win Rate : ${winRate.toFixed(1)}%**`,
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `💰 **PERFORMANCE**`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `Gross Profit : **${signedPoints(grossProfit)} Points**`,
+      `Gross Loss   : **${signedPoints(grossLoss)} Points**`,
+      ``,
+      `🏆 **NET RESULT : ${signedPoints(net)} Points**`,
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `🎯 **TARGET PERFORMANCE**`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `TP1 Hit : **${closed.filter(p => Number(p.tp1_hit) === 1).length}**`,
+      `TP2 Hit : **${closed.filter(p => Number(p.tp2_hit) === 1).length}**`,
+      `TP3 Hit : **${closed.filter(p => Number(p.tp3_hit) === 1).length}**`,
+      `SL Hit  : **${closed.filter(p => String(p.close_reason) === "Direct SL").length}**`,
+      `Protected/Reversal Exit : **${closed.filter(p => String(p.close_reason) === "Reversal Close").length}**`,
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `📊 **TIMEFRAME BREAKDOWN**`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      ...(tfLines.length ? tfLines : [`No signals in this period.`]),
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `📌 **REPORT RESULT**`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      net > 0 ? `✅ *Profitable Period*` : net < 0 ? `❌ *Loss-Making Period*` : `⚪ *Break-even Period*`,
+      `📈 Net Result : **${signedPoints(net)} Points**`,
+      `📊 Win Rate   : **${winRate.toFixed(1)}%**`,
+      ``,
+      `_Closed/Running figures refer to signals generated during the selected period._`
+    ];
+
     return this.sendText(chatId, lines.join("\n"));
   }
 
@@ -782,14 +889,18 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   const zoneFactor = { "15M": 0.22, "30M": 0.26, "1H": 0.30, "4H": 0.34 }[timeframe] || 0.22;
   const zoneWidth = clamp(atrv * zoneFactor, 0.60, 3.50);
 
-  // PRICE REFERENCE FIX:
-  // Keep all technical setup/pattern/EMA/RSI/score logic unchanged, but make
-  // the live OKX ticker price the exact entry-zone center. This means entryMid
-  // is the actual XAU-USDT-SWAP last price at signal time. applyCommunityPrice()
-  // then applies the fixed -3.88 offset exactly once to the final signal.
-  const center = price;
-  const entryLow = center - zoneWidth / 2;
-  const entryHigh = center + zoneWidth / 2;
+  let center = Number(setup.anchor || price);
+  if (!(center > 0)) center = price;
+  center = clamp(center, price - atrv * 0.9, price + atrv * 0.9);
+
+  let entryLow = center - zoneWidth / 2;
+  let entryHigh = center + zoneWidth / 2;
+
+  // For continuation/breakout setups, do not put the zone too far behind price.
+  if (setup.confirmedBreak) {
+    if (direction === "LONG") entryLow = Math.max(entryLow, price - atrv * 0.35);
+    else entryHigh = Math.min(entryHigh, price + atrv * 0.35);
+  }
 
   let sl;
   if (direction === "LONG") {
@@ -798,9 +909,9 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
     sl = Math.max(Number(setup.stopAnchor || recentHigh) + buffer, entryHigh + buffer);
   }
 
-  const safeEntryLow = Math.max(0.01, entryLow);
-  const safeEntryHigh = Math.max(safeEntryLow, entryHigh);
-  const entryMid = price;
+  entryLow = Math.max(0.01, entryLow);
+  entryHigh = Math.max(entryLow, entryHigh);
+  const entryMid = (entryLow + entryHigh) / 2;
 
   // Dynamic risk: structural SL first, ATR guard second.
   let risk = Math.abs(entryMid - sl);
@@ -813,23 +924,24 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   risk = Math.abs(entryMid - sl);
   if (!(risk >= 5.5 && risk <= 18)) return null;
 
-  // FINAL FIXED GOLD TARGETS: 8 / 15 / 25 points from Entry Mid.
-  const tp1Dist = CFG.TP1_POINTS;
-  const tp2Dist = CFG.TP2_POINTS;
-  const tp3Dist = CFG.TP3_POINTS;
+  // Fixed Gold targets: 5M = 5 / 8 / 13; 15M+ = 7 / 13 / 22.
+  const is5M = timeframe === "5M";
+  const tp1Dist = is5M ? CFG.TP1_POINTS_5M : CFG.TP1_POINTS;
+  const tp2Dist = is5M ? CFG.TP2_POINTS_5M : CFG.TP2_POINTS;
+  const tp3Dist = is5M ? CFG.TP3_POINTS_5M : CFG.TP3_POINTS;
 
   const tp1 = direction === "LONG" ? entryMid + tp1Dist : entryMid - tp1Dist;
   const tp2 = direction === "LONG" ? entryMid + tp2Dist : entryMid - tp2Dist;
   const tp3 = direction === "LONG" ? entryMid + tp3Dist : entryMid - tp3Dist;
-  if (direction === "LONG" && !(sl < safeEntryLow && tp1 < tp2 && tp2 < tp3)) return null;
-  if (direction === "SHORT" && !(sl > safeEntryHigh && tp1 > tp2 && tp2 > tp3)) return null;
+  if (direction === "LONG" && !(sl < entryLow && tp1 < tp2 && tp2 < tp3)) return null;
+  if (direction === "SHORT" && !(sl > entryHigh && tp1 > tp2 && tp2 > tp3)) return null;
 
   return {
     direction,
-    entryLow: safeEntryLow,
-    entryHigh: safeEntryHigh,
+    entryLow,
+    entryHigh,
     entryMid,
-    entry: `${fmt(safeEntryLow)} – ${fmt(safeEntryHigh)}`,
+    entry: `${fmt(entryLow)} – ${fmt(entryHigh)}`,
     slPrice: sl,
     sl: fmt(sl),
     tp1Price: tp1,
@@ -1001,7 +1113,21 @@ function atr(rows, p) {
 
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function fmt(v) { const n = Number(v); return Number.isFinite(n) && n > 0 ? n.toFixed(2) : "N/A"; }
-function fmtDate(v) { try { return new Date(v).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }); } catch (_) { return String(v || "N/A"); } }
+function fmtDate(v) {
+  try {
+    return new Date(v).toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true
+    });
+  } catch (_) {
+    return String(v || "N/A");
+  }
+}
 
 function toCommunityPrice(okxPrice) {
   const n = Number(okxPrice);
@@ -1042,6 +1168,16 @@ function formatCloseMessage(pos, directSl, closePrice, points, hits) {
   if (hits.tp2) tpLines.push("**✅ TP2 HIT 🤩**");
   if (hits.tp3) tpLines.push("**✅ TP3 HIT 🏆**");
   return `**🏆 POSITION CLOSED**\n\n**Entry:** **${fmt(pos.entry_mid)}**\n**Closed:** **${fmt(closePrice)}**\n**Points:** **${points >= 0 ? "+" : ""}${points.toFixed(2)}**${tpLines.length ? `\n\n${tpLines.join("\n")}` : ""}\n\n**🔄 Next Signal — Coming Soon**`;
+}
+
+function signedPoints(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "0.0";
+  return `${n >= 0 ? "+" : ""}${n.toFixed(1)}`;
+}
+
+function escapeMarkdown(v) {
+  return String(v || "").replace(/([_*`])/g, "\\$1");
 }
 
 async function sendChannel(env, text) { return tg(env, "sendMessage", { chat_id: env.CHANNEL_CHAT_ID || CFG.CHANNEL_CHAT_ID, text, disable_web_page_preview: true }); }
