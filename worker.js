@@ -623,28 +623,41 @@ export class GoldEngine extends DurableObject {
         const directSl = !favorableEnough && slTouched;
         const shouldClose = directSl || mfeReversalClose;
 
-        // Persist hit/high/low state BEFORE awaiting Telegram. If Telegram is
-        // temporarily unavailable, notification flags remain pending and will
-        // be retried on the next live tick/alarm instead of being lost forever.
-        if (reached.length || shouldClose) {
-          pos.tp1_hit = tp1;
-          pos.tp2_hit = tp2;
-          pos.tp3_hit = tp3;
+        // Keep normal ticker movement/high-low state IN MEMORY only.
+        // SQLite is written only for an actual TP event or a position close.
+        // This is critical: writing on every OKX tick can create D1/SQLite
+        // contention and make the monitoring path fail repeatedly.
+        pos.highest_price = high;
+        pos.lowest_price = low;
+        pos.tp1_hit = tp1;
+        pos.tp2_hit = tp2;
+        pos.tp3_hit = tp3;
+
+        if (reached.length) {
           this.ctx.storage.sql.exec(
             "UPDATE gold_positions SET tp1_hit=?,tp2_hit=?,tp3_hit=?,highest_price=?,lowest_price=? WHERE id=?",
             tp1, tp2, tp3, high, low, positionId
           );
-        } else {
-          this.ctx.storage.sql.exec(
-            "UPDATE gold_positions SET highest_price=?,lowest_price=? WHERE id=?",
-            high, low, positionId
-          );
+
+          // Send each newly-hit TP exactly once. If Telegram is temporarily
+          // unavailable, tp*_notified stays 0 and the 1-minute recovery pass
+          // will retry it — never on every market tick.
+          for (const hit of reached) {
+            const sent = await this.sendTpHit(pos, hit);
+            if (!sent) continue;
+            if (hit.n === 1) n1 = 1;
+            if (hit.n === 2) n2 = 1;
+            if (hit.n === 3) n3 = 1;
+            pos.tp1_notified = n1;
+            pos.tp2_notified = n2;
+            pos.tp3_notified = n3;
+            this.ctx.storage.sql.exec(
+              "UPDATE gold_positions SET tp1_notified=?,tp2_notified=?,tp3_notified=? WHERE id=?",
+              n1, n2, n3, positionId
+            );
+          }
         }
 
-        // IMPORTANT: Never retry pending Telegram notifications from the live tick loop.
-        // A failed send is persisted as pending and recovered only by the 1-minute alarm.
-        // This prevents a Telegram/API failure from creating a retry storm.
-        const pending = [];
         if (!shouldClose) continue;
 
         const closePrice = directSl ? price : (direction === "LONG" ? high : low);
@@ -687,8 +700,10 @@ export class GoldEngine extends DurableObject {
     if (this.closedRetryRunning) return;
     this.closedRetryRunning = true;
     try {
+      // Recover at most ONE pending notification per alarm pass. This keeps
+      // Telegram traffic bounded even after an outage/rate-limit event.
       const rows = this.ctx.storage.sql.exec(
-      "SELECT * FROM gold_positions WHERE status='CLOSED' AND channel_message_id IS NOT NULL AND (close_notified=0 OR (tp1_hit=1 AND tp1_notified=0) OR (tp2_hit=1 AND tp2_notified=0) OR (tp3_hit=1 AND tp3_notified=0)) ORDER BY id ASC LIMIT 1"
+      "SELECT * FROM gold_positions WHERE channel_message_id IS NOT NULL AND ((status='OPEN' AND ((tp1_hit=1 AND tp1_notified=0) OR (tp2_hit=1 AND tp2_notified=0) OR (tp3_hit=1 AND tp3_notified=0))) OR (status='CLOSED' AND close_notified=0)) ORDER BY id ASC LIMIT 1"
     ).toArray();
     for (const row of rows) {
       const pos = this.normalizePositionRow(row);
@@ -711,7 +726,7 @@ export class GoldEngine extends DurableObject {
         );
       }
 
-      if (!pos.close_notified) {
+      if (String(pos.status) === "CLOSED" && !pos.close_notified) {
         const msg = formatCloseMessage(pos, String(pos.close_reason) === "Direct SL", Number(pos.close_price), Number(pos.realized_points || 0), {
           tp1: !!Number(pos.tp1_hit), tp2: !!Number(pos.tp2_hit), tp3: !!Number(pos.tp3_hit)
         });
