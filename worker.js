@@ -818,8 +818,8 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   // PRICE REFERENCE LOCK: raw OKX ticker price is the exact live entry center.
   // Strategy calculations above are unchanged; community conversion happens only in output.
   const center = price;
-  const entryLow = center - zoneWidth / 2;
-  const entryHigh = center + zoneWidth / 2;
+  let entryLow = center - zoneWidth / 2;
+  let entryHigh = center + zoneWidth / 2;
 
   let sl;
   if (direction === "LONG") {
