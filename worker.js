@@ -132,6 +132,10 @@ export class GoldEngine extends DurableObject {
       tp1_hit INTEGER DEFAULT 0,
       tp2_hit INTEGER DEFAULT 0,
       tp3_hit INTEGER DEFAULT 0,
+      tp1_notified INTEGER DEFAULT 0,
+      tp2_notified INTEGER DEFAULT 0,
+      tp3_notified INTEGER DEFAULT 0,
+      close_notified INTEGER DEFAULT 0,
       highest_price REAL,
       lowest_price REAL,
       status TEXT DEFAULT 'OPEN',
@@ -164,6 +168,10 @@ export class GoldEngine extends DurableObject {
     try { sql.exec("ALTER TABLE gold_signal_history ADD COLUMN timeframe TEXT"); } catch (_) {}
     try { sql.exec("ALTER TABLE gold_signal_history ADD COLUMN candle_ts INTEGER"); } catch (_) {}
     try { sql.exec("ALTER TABLE gold_signal_history ADD COLUMN signal_key TEXT"); } catch (_) {}
+    try { sql.exec("ALTER TABLE gold_positions ADD COLUMN tp1_notified INTEGER DEFAULT 0"); } catch (_) {}
+    try { sql.exec("ALTER TABLE gold_positions ADD COLUMN tp2_notified INTEGER DEFAULT 0"); } catch (_) {}
+    try { sql.exec("ALTER TABLE gold_positions ADD COLUMN tp3_notified INTEGER DEFAULT 0"); } catch (_) {}
+    try { sql.exec("ALTER TABLE gold_positions ADD COLUMN close_notified INTEGER DEFAULT 0"); } catch (_) {}
     sql.exec(`CREATE TABLE IF NOT EXISTS gold_meta (key TEXT PRIMARY KEY, value TEXT);`);
     sql.exec(`CREATE TABLE IF NOT EXISTS gold_candle_evaluations (timeframe TEXT NOT NULL, candle_ts INTEGER NOT NULL, evaluated_at TEXT NOT NULL, PRIMARY KEY(timeframe, candle_ts));`);
   }
@@ -204,6 +212,10 @@ export class GoldEngine extends DurableObject {
         tp1_hit: Number(row.tp1_hit || 0),
         tp2_hit: Number(row.tp2_hit || 0),
         tp3_hit: Number(row.tp3_hit || 0),
+        tp1_notified: Number(row.tp1_notified || 0),
+        tp2_notified: Number(row.tp2_notified || 0),
+        tp3_notified: Number(row.tp3_notified || 0),
+        close_notified: Number(row.close_notified || 0),
         highest_price: Number(row.highest_price || row.entry_mid),
         lowest_price: Number(row.lowest_price || row.entry_mid)
       });
@@ -349,8 +361,9 @@ export class GoldEngine extends DurableObject {
     for (const x of m.data) {
       const candle = parseCandle(x);
       if (!(candle.c > 0)) continue;
-      this.lastOkxPrice = candle.c;
-      this.lastPrice = toCommunityPrice(candle.c);
+      // Candle closes are for strategy analysis only. The live trade/monitoring
+      // reference MUST remain the raw OKX ticker last converted by exactly -3.88.
+      // Never let a business/candle update overwrite lastOkxPrice/lastPrice.
       const arr = this.candles[tf.key] || (this.candles[tf.key] = []);
       const idx = arr.findIndex(c => c.ts === candle.ts);
       if (idx >= 0) arr[idx] = candle;
@@ -382,7 +395,10 @@ export class GoldEngine extends DurableObject {
   async alarmTick() {
     await this.init();
     this.connectSockets();
+    // Primary monitoring uses the live OKX ticker converted by -3.88.
+    // The 1-minute alarm is the backup pass in case a websocket tick was missed.
     if (this.lastPrice > 0) await this.monitorPositions(this.lastPrice);
+    else await this.retryPendingClosedNotifications();
     // If a socket restarted after a cold DO wake, refresh history if a
     // timeframe is too short for indicators.
     for (const tf of CFG.TIMEFRAMES) {
@@ -505,7 +521,9 @@ export class GoldEngine extends DurableObject {
           id: positionId, symbol: CFG.OKX_INST_ID, direction: setup.direction,
           entry_low: setup.entryLow, entry_high: setup.entryHigh, entry_mid: setup.entryMid,
           sl_price: setup.slPrice, tp1_price: setup.tp1Price, tp2_price: setup.tp2Price, tp3_price: setup.tp3Price,
-          tp1_hit: 0, tp2_hit: 0, tp3_hit: 0, highest_price: setup.entryMid, lowest_price: setup.entryMid,
+          tp1_hit: 0, tp2_hit: 0, tp3_hit: 0,
+          tp1_notified: 0, tp2_notified: 0, tp3_notified: 0, close_notified: 0,
+          highest_price: setup.entryMid, lowest_price: setup.entryMid,
           status: "OPEN", channel_message_id: Number(sent.message_id), setup: setup.setup, timeframe: setup.timeframe,
           opened_at: new Date().toISOString()
         });
@@ -529,72 +547,93 @@ export class GoldEngine extends DurableObject {
   wasRecentSameSetup(_) { return false; }
 
   async monitorPositions(price) {
-    if (!(price > 0) || !this.openPositions.size) return;
+    if (!(price > 0)) return;
 
-    // Price passed here is already converted to the community/MT5 reference scale.
-    // Do not write high/low to SQLite on ordinary ticks.
-    for (const [positionId, pos] of Array.from(this.openPositions.entries())) {
-      if (pos.status !== "OPEN") continue;
+    // The monitoring price is ALWAYS the live community/MT5 reference:
+    // raw OKX ticker last - 3.88. Candle prices are never used here.
+    if (this.openPositions.size) {
+      for (const [positionId, pos] of Array.from(this.openPositions.entries())) {
+        if (pos.status !== "OPEN") continue;
 
-      const direction = pos.direction;
-      const high = Math.max(Number(pos.highest_price || pos.entry_mid), price);
-      const low = Math.min(Number(pos.lowest_price || pos.entry_mid), price);
-      pos.highest_price = high;
-      pos.lowest_price = low;
+        const direction = pos.direction;
+        const high = Math.max(Number(pos.highest_price || pos.entry_mid), price);
+        const low = Math.min(Number(pos.lowest_price || pos.entry_mid), price);
+        pos.highest_price = high;
+        pos.lowest_price = low;
 
-      let tp1 = Number(pos.tp1_hit || 0);
-      let tp2 = Number(pos.tp2_hit || 0);
-      let tp3 = Number(pos.tp3_hit || 0);
-      const reached = [];
-      const tests = [[1, Number(pos.tp1_price)], [2, Number(pos.tp2_price)], [3, Number(pos.tp3_price)]];
+        let tp1 = Number(pos.tp1_hit || 0);
+        let tp2 = Number(pos.tp2_hit || 0);
+        let tp3 = Number(pos.tp3_hit || 0);
+        let n1 = Number(pos.tp1_notified || 0);
+        let n2 = Number(pos.tp2_notified || 0);
+        let n3 = Number(pos.tp3_notified || 0);
+        const reached = [];
+        const tests = [[1, Number(pos.tp1_price)], [2, Number(pos.tp2_price)], [3, Number(pos.tp3_price)]];
 
-      for (const [n, target] of tests) {
-        const alreadyHit = n === 1 ? tp1 : n === 2 ? tp2 : tp3;
-        if (alreadyHit || !(target > 0)) continue;
-        const hit = direction === "LONG" ? high >= target : low <= target;
-        if (!hit) continue;
-        if (n === 1) tp1 = 1;
-        if (n === 2) tp2 = 1;
-        if (n === 3) tp3 = 1;
-        reached.push({ n, target });
-      }
+        for (const [n, target] of tests) {
+          const alreadyHit = n === 1 ? tp1 : n === 2 ? tp2 : tp3;
+          if (alreadyHit || !(target > 0)) continue;
+          const hit = direction === "LONG" ? high >= target : low <= target;
+          if (!hit) continue;
+          if (n === 1) tp1 = 1;
+          if (n === 2) tp2 = 1;
+          if (n === 3) tp3 = 1;
+          reached.push({ n, target });
+        }
 
-      const sl = Number(pos.sl_price);
-      const slTouched = direction === "LONG" ? price <= sl : price >= sl;
-      const entry = Number(pos.entry_mid);
-      const peakPoints = direction === "LONG"
-        ? high - entry
-        : entry - low;
-      const favorableEnough = peakPoints >= CFG.REVERSAL_MIN_FAVORABLE_POINTS;
-      const reversalGap = pos.timeframe === "5M" ? CFG.REVERSAL_GAP_5M : CFG.REVERSAL_GAP_LARGE_TF;
+        const sl = Number(pos.sl_price);
+        const slTouched = direction === "LONG" ? price <= sl : price >= sl;
+        const entry = Number(pos.entry_mid);
+        const peakPoints = direction === "LONG" ? high - entry : entry - low;
+        const favorableEnough = peakPoints >= CFG.REVERSAL_MIN_FAVORABLE_POINTS;
+        const reversalGap = pos.timeframe === "5M" ? CFG.REVERSAL_GAP_5M : CFG.REVERSAL_GAP_LARGE_TF;
+        const mfeReversalClose = favorableEnough && (direction === "LONG"
+          ? price <= high - reversalGap
+          : price >= low + reversalGap);
+        const directSl = !favorableEnough && slTouched;
+        const shouldClose = directSl || mfeReversalClose;
 
-      // New MFE protection: once the position has moved at least +5 points
-      // in its favor, a reversal of the timeframe-specific gap closes it.
-      // TP1 is NOT required for this protection to activate.
-      const mfeReversalClose = favorableEnough && (direction === "LONG"
-        ? price <= high - reversalGap
-        : price >= low + reversalGap);
+        // Persist hit/high/low state BEFORE awaiting Telegram. If Telegram is
+        // temporarily unavailable, notification flags remain pending and will
+        // be retried on the next live tick/alarm instead of being lost forever.
+        if (reached.length || shouldClose) {
+          pos.tp1_hit = tp1;
+          pos.tp2_hit = tp2;
+          pos.tp3_hit = tp3;
+          this.ctx.storage.sql.exec(
+            "UPDATE gold_positions SET tp1_hit=?,tp2_hit=?,tp3_hit=?,highest_price=?,lowest_price=? WHERE id=?",
+            tp1, tp2, tp3, high, low, positionId
+          );
+        } else {
+          this.ctx.storage.sql.exec(
+            "UPDATE gold_positions SET highest_price=?,lowest_price=? WHERE id=?",
+            high, low, positionId
+          );
+        }
 
-      // Preserve the existing SL rule: before a +5 point favorable move,
-      // only the original SL can directly close the trade.
-      const directSl = !favorableEnough && slTouched;
-      const shouldClose = directSl || mfeReversalClose;
+        // First retry any TP events that were recorded earlier but whose Telegram
+        // notification failed. This is what prevents a missed TP post after a
+        // transient Telegram/API failure.
+        const pending = [];
+        if (tp1 && !n1) pending.push({ n: 1, target: Number(pos.tp1_price) });
+        if (tp2 && !n2) pending.push({ n: 2, target: Number(pos.tp2_price) });
+        if (tp3 && !n3) pending.push({ n: 3, target: Number(pos.tp3_price) });
+        for (const hit of pending) {
+          const ok = await this.sendTpHit(pos, hit);
+          if (!ok) continue;
+          if (hit.n === 1) { n1 = 1; pos.tp1_notified = 1; }
+          if (hit.n === 2) { n2 = 1; pos.tp2_notified = 1; }
+          if (hit.n === 3) { n3 = 1; pos.tp3_notified = 1; }
+          this.ctx.storage.sql.exec(
+            "UPDATE gold_positions SET tp1_notified=?,tp2_notified=?,tp3_notified=? WHERE id=?",
+            n1, n2, n3, positionId
+          );
+        }
 
-      if (!reached.length && !shouldClose) continue;
+        if (!shouldClose) continue;
 
-      pos.tp1_hit = tp1;
-      pos.tp2_hit = tp2;
-      pos.tp3_hit = tp3;
-
-      if (shouldClose) {
-        // If the trade first moved >=5 points in favor, report the best favorable
-        // price (MFE) as the close reference, not the later SL price.
-        const closePrice = directSl
-          ? price
-          : (direction === "LONG" ? high : low);
-        const realizedPoints = direction === "LONG"
-          ? closePrice - Number(pos.entry_mid)
-          : Number(pos.entry_mid) - closePrice;
+        const closePrice = directSl ? price : (direction === "LONG" ? high : low);
+        const realizedPoints = direction === "LONG" ? closePrice - entry : entry - closePrice;
         const reason = directSl ? "Direct SL" : "Reversal Close";
 
         this.ctx.storage.sql.exec(
@@ -607,25 +646,84 @@ export class GoldEngine extends DurableObject {
         pos.realized_points = realizedPoints;
         pos.peak_points = peakPoints;
 
-        // If TP(s) and SL/reversal happen in the same market tick, send TP updates
-        // first, then the final close message.
-        for (const hit of reached) await this.sendTpHit(pos, hit);
-
-        const msg = formatCloseMessage(pos, directSl, closePrice, realizedPoints, {
+        const closeMsg = formatCloseMessage(pos, directSl, closePrice, realizedPoints, {
           tp1: !!tp1, tp2: !!tp2, tp3: !!tp3
         });
-        if (pos.channel_message_id) await sendReply(this.env, msg, pos.channel_message_id);
+        let closeSent = true;
+        if (pos.channel_message_id) {
+          const sent = await sendReply(this.env, closeMsg, pos.channel_message_id);
+          closeSent = !!sent;
+          if (closeSent) {
+            pos.close_notified = 1;
+            this.ctx.storage.sql.exec("UPDATE gold_positions SET close_notified=1 WHERE id=?", positionId);
+          }
+        }
+
+        // Keep the closed row in DB for reporting. Remove it from the live cache.
         this.openPositions.delete(positionId);
-        continue;
+        if (!closeSent) console.error("GOLD CLOSE NOTIFICATION PENDING", positionId);
+      }
+    }
+
+    // Recover any closed-position Telegram notifications that failed during the
+    // original close event. This is DB-backed, so it survives a DO restart.
+    await this.retryPendingClosedNotifications();
+  }
+
+  async retryPendingClosedNotifications() {
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT * FROM gold_positions WHERE status='CLOSED' AND channel_message_id IS NOT NULL AND (close_notified=0 OR (tp1_hit=1 AND tp1_notified=0) OR (tp2_hit=1 AND tp2_notified=0) OR (tp3_hit=1 AND tp3_notified=0)) ORDER BY id ASC LIMIT 10"
+    ).toArray();
+    for (const row of rows) {
+      const pos = this.normalizePositionRow(row);
+
+      // Retry any TP notification that was recorded as hit but not confirmed
+      // delivered. This survives worker/Telegram failures even after the trade closes.
+      const pendingTp = [];
+      if (pos.tp1_hit && !pos.tp1_notified) pendingTp.push({ n: 1, target: Number(pos.tp1_price) });
+      if (pos.tp2_hit && !pos.tp2_notified) pendingTp.push({ n: 2, target: Number(pos.tp2_price) });
+      if (pos.tp3_hit && !pos.tp3_notified) pendingTp.push({ n: 3, target: Number(pos.tp3_price) });
+      for (const hit of pendingTp) {
+        const sent = await this.sendTpHit(pos, hit);
+        if (!sent) continue;
+        if (hit.n === 1) pos.tp1_notified = 1;
+        if (hit.n === 2) pos.tp2_notified = 1;
+        if (hit.n === 3) pos.tp3_notified = 1;
+        this.ctx.storage.sql.exec(
+          "UPDATE gold_positions SET tp1_notified=?,tp2_notified=?,tp3_notified=? WHERE id=?",
+          pos.tp1_notified, pos.tp2_notified, pos.tp3_notified, Number(pos.id)
+        );
       }
 
-      // One DB write for actual TP events only. Ordinary ticker movement stays in memory.
-      this.ctx.storage.sql.exec(
-        "UPDATE gold_positions SET tp1_hit=?,tp2_hit=?,tp3_hit=?,highest_price=?,lowest_price=? WHERE id=?",
-        tp1, tp2, tp3, high, low, positionId
-      );
-      for (const hit of reached) await this.sendTpHit(pos, hit);
+      if (!pos.close_notified) {
+        const msg = formatCloseMessage(pos, String(pos.close_reason) === "Direct SL", Number(pos.close_price), Number(pos.realized_points || 0), {
+          tp1: !!Number(pos.tp1_hit), tp2: !!Number(pos.tp2_hit), tp3: !!Number(pos.tp3_hit)
+        });
+        const sent = await sendReply(this.env, msg, pos.channel_message_id);
+        if (sent) this.ctx.storage.sql.exec("UPDATE gold_positions SET close_notified=1 WHERE id=?", Number(pos.id));
+      }
     }
+  }
+
+  normalizePositionRow(row) {
+    return {
+      ...row,
+      id: Number(row.id),
+      entry_mid: Number(row.entry_mid),
+      sl_price: Number(row.sl_price),
+      tp1_price: Number(row.tp1_price),
+      tp2_price: Number(row.tp2_price),
+      tp3_price: Number(row.tp3_price),
+      tp1_hit: Number(row.tp1_hit || 0),
+      tp2_hit: Number(row.tp2_hit || 0),
+      tp3_hit: Number(row.tp3_hit || 0),
+      tp1_notified: Number(row.tp1_notified || 0),
+      tp2_notified: Number(row.tp2_notified || 0),
+      tp3_notified: Number(row.tp3_notified || 0),
+      close_notified: Number(row.close_notified || 0),
+      highest_price: Number(row.highest_price || row.entry_mid),
+      lowest_price: Number(row.lowest_price || row.entry_mid)
+    };
   }
 
   async sendTpHit(pos, hit) {
@@ -635,7 +733,9 @@ export class GoldEngine extends DurableObject {
     const heading = hit.n === 1 ? "**✅ TP1 HIT 😎**" : hit.n === 2 ? "**✅ TP2 HIT 🤩**" : "**✅ TP3 HIT 🏆**";
     const next = hit.n === 1 ? "**🎯 TP2 — Coming Soon**" : hit.n === 2 ? "**🎯 TP3 — Coming Soon**" : "**🏆 Position Still Running**";
     const msg = `${heading}\n\n**Entry:** **${fmt(entry)}**\n**Current:** **${fmt(current)}**\n**Points:** **${points >= 0 ? "+" : ""}${points.toFixed(2)}**\n\n${next}`;
-    if (pos.channel_message_id) await sendReply(this.env, msg, pos.channel_message_id);
+    if (!pos.channel_message_id) return true;
+    const sent = await sendReply(this.env, msg, pos.channel_message_id);
+    return !!sent;
   }
 
   async sendPositions(chatId) {
