@@ -886,7 +886,7 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   const recentLow = Math.min(...lows.slice(-15));
   const recentHigh = Math.max(...highs.slice(-15));
   const buffer = Math.max(0.35, atrv * 0.12);
-  const zoneFactor = { "15M": 0.22, "30M": 0.26, "1H": 0.30, "4H": 0.34 }[timeframe] || 0.22;
+  const zoneFactor = { "5M": 0.16, "15M": 0.22, "30M": 0.26, "1H": 0.30, "4H": 0.34 }[timeframe] || 0.22;
   const zoneWidth = clamp(atrv * zoneFactor, 0.60, 3.50);
 
   let center = Number(setup.anchor || price);
@@ -913,16 +913,24 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   entryHigh = Math.max(entryLow, entryHigh);
   const entryMid = (entryLow + entryHigh) / 2;
 
-  // Dynamic risk: structural SL first, ATR guard second.
-  let risk = Math.abs(entryMid - sl);
-  const minRisk = clamp(atrv * 0.45, 5.5, 8.0);
-  const maxRisk = clamp(atrv * 1.35, 10, 18);
-  if (risk < minRisk || risk > maxRisk) {
-    risk = clamp(risk, minRisk, maxRisk);
-    sl = direction === "LONG" ? entryMid - risk : entryMid + risk;
-  }
-  risk = Math.abs(entryMid - sl);
-  if (!(risk >= 5.5 && risk <= 18)) return null;
+  // Timeframe-aware structural SL: calculate the SL from chart structure first,
+  // then ACCEPT the setup only if the natural structural risk fits that
+  // timeframe's range. Do not artificially widen/tighten the SL.
+  // This keeps 5M scalps tight while allowing larger timeframes proportionally
+  // more room, without turning the SL into a fixed/random distance.
+  const SL_RANGES = {
+    "5M":  { min: 3, max: 5 },
+    "15M": { min: 4, max: 7 },
+    "30M": { min: 5, max: 8 },
+    "1H":  { min: 6, max: 10 },
+    "4H":  { min: 7, max: 12 }
+  };
+  const slRange = SL_RANGES[timeframe] || { min: 5, max: 8 };
+  const risk = Math.abs(entryMid - sl);
+
+  // If the chart's natural structural SL is outside the timeframe range,
+  // reject the setup instead of moving the SL away from the actual structure.
+  if (!(risk >= slRange.min && risk <= slRange.max)) return null;
 
   // Fixed Gold targets: 5M = 5 / 8 / 13; 15M+ = 7 / 13 / 22.
   const is5M = timeframe === "5M";
