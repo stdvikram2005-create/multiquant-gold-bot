@@ -10,16 +10,17 @@ const CFG = {
   MAX_OPEN_POSITIONS: 5,
   // Fixed community/MT5 reference conversion: Community Price = OKX Price - 3.88
   GOLD_PRICE_OFFSET: -3.88,
-  TP1_POINTS: 7,
-  TP2_POINTS: 13,
-  TP3_POINTS: 22,
-  TP1_POINTS_5M: 5,
-  TP2_POINTS_5M: 8,
-  TP3_POINTS_5M: 13,
-  REVERSAL_MIN_FAVORABLE_POINTS: 5,
-  REVERSAL_GAP_5M: 3,
-  REVERSAL_GAP_LARGE_TF: 5,
-  // 5M is now an active signal timeframe. Strategy logic remains unchanged.
+  // Target distances are timeframe-aware. 5M uses tighter targets.
+  TP_POINTS: {
+    "5M": [5, 8, 13],
+    "15M": [7, 13, 22],
+    "30M": [7, 13, 22],
+    "1H": [7, 13, 22],
+    "4H": [7, 13, 22]
+  },
+  MFE_MIN_FAVORABLE_POINTS: 5,
+  MFE_REVERSE_POINTS: { "5M": 3, "15M": 5, "30M": 5, "1H": 5, "4H": 5 },
+  // 5M is execution/entry timing only. Signals are generated from 15M+ structure.
   TIMEFRAMES: [
     { key: "5M", channel: "candle5m", bar: "5m", history: 180, signal: true },
     { key: "15M", channel: "candle15m", bar: "15m", history: 160, signal: true },
@@ -97,11 +98,10 @@ export class GoldEngine extends DurableObject {
     this.lastEvaluatedCandleTs = new Map();
     this.signalSendInFlight = false;
     this.openPositions = new Map();
-    // Position monitoring is single-flight. OKX can emit many ticks while a
-    // Telegram request is awaiting; never allow overlapping monitor passes.
-    this.monitorRunning = false;
-    this.pendingMonitorPrice = 0;
-    this.closedRetryRunning = false;
+    // Single-flight monitor: OKX can emit many ticker ticks per second. Never
+    // allow two monitor passes to process the same position concurrently.
+    this.monitorInFlight = false;
+    this.monitorPendingPrice = 0;
     this.initialized = false;
     this.initPromise = null;
     this.ctx.blockConcurrencyWhile(async () => { await this.init(); });
@@ -137,10 +137,6 @@ export class GoldEngine extends DurableObject {
       tp1_hit INTEGER DEFAULT 0,
       tp2_hit INTEGER DEFAULT 0,
       tp3_hit INTEGER DEFAULT 0,
-      tp1_notified INTEGER DEFAULT 0,
-      tp2_notified INTEGER DEFAULT 0,
-      tp3_notified INTEGER DEFAULT 0,
-      close_notified INTEGER DEFAULT 0,
       highest_price REAL,
       lowest_price REAL,
       status TEXT DEFAULT 'OPEN',
@@ -173,10 +169,6 @@ export class GoldEngine extends DurableObject {
     try { sql.exec("ALTER TABLE gold_signal_history ADD COLUMN timeframe TEXT"); } catch (_) {}
     try { sql.exec("ALTER TABLE gold_signal_history ADD COLUMN candle_ts INTEGER"); } catch (_) {}
     try { sql.exec("ALTER TABLE gold_signal_history ADD COLUMN signal_key TEXT"); } catch (_) {}
-    try { sql.exec("ALTER TABLE gold_positions ADD COLUMN tp1_notified INTEGER DEFAULT 0"); } catch (_) {}
-    try { sql.exec("ALTER TABLE gold_positions ADD COLUMN tp2_notified INTEGER DEFAULT 0"); } catch (_) {}
-    try { sql.exec("ALTER TABLE gold_positions ADD COLUMN tp3_notified INTEGER DEFAULT 0"); } catch (_) {}
-    try { sql.exec("ALTER TABLE gold_positions ADD COLUMN close_notified INTEGER DEFAULT 0"); } catch (_) {}
     sql.exec(`CREATE TABLE IF NOT EXISTS gold_meta (key TEXT PRIMARY KEY, value TEXT);`);
     sql.exec(`CREATE TABLE IF NOT EXISTS gold_candle_evaluations (timeframe TEXT NOT NULL, candle_ts INTEGER NOT NULL, evaluated_at TEXT NOT NULL, PRIMARY KEY(timeframe, candle_ts));`);
   }
@@ -217,10 +209,6 @@ export class GoldEngine extends DurableObject {
         tp1_hit: Number(row.tp1_hit || 0),
         tp2_hit: Number(row.tp2_hit || 0),
         tp3_hit: Number(row.tp3_hit || 0),
-        tp1_notified: Number(row.tp1_notified || 0),
-        tp2_notified: Number(row.tp2_notified || 0),
-        tp3_notified: Number(row.tp3_notified || 0),
-        close_notified: Number(row.close_notified || 0),
         highest_price: Number(row.highest_price || row.entry_mid),
         lowest_price: Number(row.lowest_price || row.entry_mid)
       });
@@ -347,7 +335,7 @@ export class GoldEngine extends DurableObject {
         this.lastOkxPrice = price;
         this.lastPrice = toCommunityPrice(price);
         this.lastTickerTs = Number(x.ts || Date.now());
-        this.monitorPositions(this.lastPrice).catch(e => console.error("GOLD MONITOR ERROR", e));
+        this.requestMonitor(this.lastPrice);
       }
     }
   }
@@ -366,9 +354,8 @@ export class GoldEngine extends DurableObject {
     for (const x of m.data) {
       const candle = parseCandle(x);
       if (!(candle.c > 0)) continue;
-      // Candle closes are for strategy analysis only. The live trade/monitoring
-      // reference MUST remain the raw OKX ticker last converted by exactly -3.88.
-      // Never let a business/candle update overwrite lastOkxPrice/lastPrice.
+      // Candle closes are strategy/candle structure only. The public ticker is
+      // the sole authority for live OKX price / signal entry / position monitoring.
       const arr = this.candles[tf.key] || (this.candles[tf.key] = []);
       const idx = arr.findIndex(c => c.ts === candle.ts);
       if (idx >= 0) arr[idx] = candle;
@@ -400,12 +387,7 @@ export class GoldEngine extends DurableObject {
   async alarmTick() {
     await this.init();
     this.connectSockets();
-    // Primary monitoring uses the live OKX ticker converted by -3.88.
-    // The 1-minute alarm is the backup pass in case a websocket tick was missed.
-    if (this.lastPrice > 0) await this.monitorPositions(this.lastPrice);
-    // Closed-position notification recovery runs only on the 1-minute backup,
-    // never on every OKX tick. This prevents retry storms and Telegram 429 floods.
-    await this.retryPendingClosedNotifications();
+    if (this.lastPrice > 0) await this.requestMonitor(this.lastPrice);
     // If a socket restarted after a cold DO wake, refresh history if a
     // timeframe is too short for indicators.
     for (const tf of CFG.TIMEFRAMES) {
@@ -528,9 +510,7 @@ export class GoldEngine extends DurableObject {
           id: positionId, symbol: CFG.OKX_INST_ID, direction: setup.direction,
           entry_low: setup.entryLow, entry_high: setup.entryHigh, entry_mid: setup.entryMid,
           sl_price: setup.slPrice, tp1_price: setup.tp1Price, tp2_price: setup.tp2Price, tp3_price: setup.tp3Price,
-          tp1_hit: 0, tp2_hit: 0, tp3_hit: 0,
-          tp1_notified: 0, tp2_notified: 0, tp3_notified: 0, close_notified: 0,
-          highest_price: setup.entryMid, lowest_price: setup.entryMid,
+          tp1_hit: 0, tp2_hit: 0, tp3_hit: 0, highest_price: setup.entryMid, lowest_price: setup.entryMid,
           status: "OPEN", channel_message_id: Number(sent.message_id), setup: setup.setup, timeframe: setup.timeframe,
           opened_at: new Date().toISOString()
         });
@@ -553,211 +533,122 @@ export class GoldEngine extends DurableObject {
 
   wasRecentSameSetup(_) { return false; }
 
-  async monitorPositions(price) {
-    if (!(price > 0)) return;
-
-    // SINGLE-FLIGHT GUARD: live OKX ticks can arrive while Telegram awaits.
-    // Keep only the latest price and let the current pass finish first.
-    if (this.monitorRunning) {
-      this.pendingMonitorPrice = price;
-      return;
-    }
-
-    this.monitorRunning = true;
-    try {
-      let nextPrice = price;
-      for (let pass = 0; pass < 2; pass++) {
-        this.pendingMonitorPrice = 0;
-        await this._monitorPositionsOnce(nextPrice);
-        const latest = Number(this.pendingMonitorPrice || 0);
-        if (!(latest > 0) || latest === nextPrice) break;
-        nextPrice = latest;
+  requestMonitor(price) {
+    const n = Number(price);
+    if (!(n > 0)) return Promise.resolve();
+    this.monitorPendingPrice = n;
+    if (this.monitorInFlight) return Promise.resolve();
+    this.monitorInFlight = true;
+    return (async () => {
+      try {
+        while (this.monitorPendingPrice > 0) {
+          const next = this.monitorPendingPrice;
+          this.monitorPendingPrice = 0;
+          await this.monitorPositions(next);
+        }
+      } catch (e) {
+        console.error("GOLD MONITOR ERROR", e);
+      } finally {
+        this.monitorInFlight = false;
+        if (this.monitorPendingPrice > 0) this.requestMonitor(this.monitorPendingPrice);
       }
-    } finally {
-      this.monitorRunning = false;
-    }
+    })();
   }
 
-  async _monitorPositionsOnce(price) {
-    // The monitoring price is ALWAYS the live community/MT5 reference:
-    // raw OKX ticker last - 3.88. Candle prices are never used here.
-    if (this.openPositions.size) {
-      for (const [positionId, pos] of Array.from(this.openPositions.entries())) {
-        if (pos.status !== "OPEN") continue;
+  async monitorPositions(price) {
+    if (!(price > 0) || !this.openPositions.size) return;
 
-        const direction = pos.direction;
-        const high = Math.max(Number(pos.highest_price || pos.entry_mid), price);
-        const low = Math.min(Number(pos.lowest_price || pos.entry_mid), price);
-        pos.highest_price = high;
-        pos.lowest_price = low;
+    // This method is single-flight. Every position is processed sequentially,
+    // and the database uses status/hit guards so a restart or duplicate event
+    // cannot turn one TP/close into a message storm.
+    for (const [positionId, pos] of Array.from(this.openPositions.entries())) {
+      if (pos.status !== "OPEN") continue;
 
-        let tp1 = Number(pos.tp1_hit || 0);
-        let tp2 = Number(pos.tp2_hit || 0);
-        let tp3 = Number(pos.tp3_hit || 0);
-        let n1 = Number(pos.tp1_notified || 0);
-        let n2 = Number(pos.tp2_notified || 0);
-        let n3 = Number(pos.tp3_notified || 0);
-        const reached = [];
-        const tests = [[1, Number(pos.tp1_price)], [2, Number(pos.tp2_price)], [3, Number(pos.tp3_price)]];
+      const direction = pos.direction;
+      const entry = Number(pos.entry_mid);
+      const high = Math.max(Number(pos.highest_price || entry), price);
+      const low = Math.min(Number(pos.lowest_price || entry), price);
+      pos.highest_price = high;
+      pos.lowest_price = low;
 
-        for (const [n, target] of tests) {
-          const alreadyHit = n === 1 ? tp1 : n === 2 ? tp2 : tp3;
-          if (alreadyHit || !(target > 0)) continue;
-          const hit = direction === "LONG" ? high >= target : low <= target;
-          if (!hit) continue;
-          if (n === 1) tp1 = 1;
-          if (n === 2) tp2 = 1;
-          if (n === 3) tp3 = 1;
-          reached.push({ n, target });
-        }
+      let tp1 = Number(pos.tp1_hit || 0);
+      let tp2 = Number(pos.tp2_hit || 0);
+      let tp3 = Number(pos.tp3_hit || 0);
+      const reached = [];
+      const tests = [[1, Number(pos.tp1_price)], [2, Number(pos.tp2_price)], [3, Number(pos.tp3_price)]];
 
-        const sl = Number(pos.sl_price);
-        const slTouched = direction === "LONG" ? price <= sl : price >= sl;
-        const entry = Number(pos.entry_mid);
-        const peakPoints = direction === "LONG" ? high - entry : entry - low;
-        const favorableEnough = peakPoints >= CFG.REVERSAL_MIN_FAVORABLE_POINTS;
-        const reversalGap = pos.timeframe === "5M" ? CFG.REVERSAL_GAP_5M : CFG.REVERSAL_GAP_LARGE_TF;
-        const mfeReversalClose = favorableEnough && (direction === "LONG"
-          ? price <= high - reversalGap
-          : price >= low + reversalGap);
-        const directSl = !favorableEnough && slTouched;
-        const shouldClose = directSl || mfeReversalClose;
+      for (const [n, target] of tests) {
+        const alreadyHit = n === 1 ? tp1 : n === 2 ? tp2 : tp3;
+        if (alreadyHit || !(target > 0)) continue;
+        const hit = direction === "LONG" ? high >= target : low <= target;
+        if (!hit) continue;
+        if (n === 1) tp1 = 1;
+        if (n === 2) tp2 = 1;
+        if (n === 3) tp3 = 1;
+        reached.push({ n, target });
+      }
 
-        // Keep normal ticker movement/high-low state IN MEMORY only.
-        // SQLite is written only for an actual TP event or a position close.
-        // This is critical: writing on every OKX tick can create D1/SQLite
-        // contention and make the monitoring path fail repeatedly.
-        pos.highest_price = high;
-        pos.lowest_price = low;
-        pos.tp1_hit = tp1;
-        pos.tp2_hit = tp2;
-        pos.tp3_hit = tp3;
+      const sl = Number(pos.sl_price);
+      const slTouched = direction === "LONG" ? price <= sl : price >= sl;
+      const peakPoints = direction === "LONG" ? high - entry : entry - low;
+      const mfeReverse = Number(CFG.MFE_REVERSE_POINTS[pos.timeframe] || 5);
+      const mfeArmed = peakPoints >= CFG.MFE_MIN_FAVORABLE_POINTS;
+      const retraceFromMfe = direction === "LONG" ? high - price : price - low;
+      const mfeClose = mfeArmed && retraceFromMfe >= mfeReverse;
 
-        if (reached.length) {
-          this.ctx.storage.sql.exec(
-            "UPDATE gold_positions SET tp1_hit=?,tp2_hit=?,tp3_hit=?,highest_price=?,lowest_price=? WHERE id=?",
-            tp1, tp2, tp3, high, low, positionId
-          );
+      // Direct SL is only allowed before the +5 point MFE protection is armed.
+      // Once armed, the trade closes only when price reverses by the timeframe's
+      // MFE amount (5M=3 points, 15M+=5 points). TP hits never create a second
+      // close path by themselves.
+      const directSl = slTouched && !mfeArmed;
+      const shouldClose = directSl || mfeClose;
 
-          // Send each newly-hit TP exactly once. If Telegram is temporarily
-          // unavailable, tp*_notified stays 0 and the 1-minute recovery pass
-          // will retry it — never on every market tick.
-          for (const hit of reached) {
-            const sent = await this.sendTpHit(pos, hit);
-            if (!sent) continue;
-            if (hit.n === 1) n1 = 1;
-            if (hit.n === 2) n2 = 1;
-            if (hit.n === 3) n3 = 1;
-            pos.tp1_notified = n1;
-            pos.tp2_notified = n2;
-            pos.tp3_notified = n3;
-            this.ctx.storage.sql.exec(
-              "UPDATE gold_positions SET tp1_notified=?,tp2_notified=?,tp3_notified=? WHERE id=?",
-              n1, n2, n3, positionId
-            );
-          }
-        }
+      if (!reached.length && !shouldClose) continue;
 
-        if (!shouldClose) continue;
-
-        const closePrice = directSl ? price : (direction === "LONG" ? high : low);
+      if (shouldClose) {
+        const closePrice = price;
         const realizedPoints = direction === "LONG" ? closePrice - entry : entry - closePrice;
-        const reason = directSl ? "Direct SL" : "Reversal Close";
+        const reason = directSl ? "Direct SL" : "MFE Reversal";
 
-        this.ctx.storage.sql.exec(
-          "UPDATE gold_positions SET status='CLOSED',tp1_hit=?,tp2_hit=?,tp3_hit=?,highest_price=?,lowest_price=?,closed_at=?,close_price=?,close_reason=?,realized_points=?,peak_points=? WHERE id=?",
+        // Atomic close claim: only the first monitor pass that still sees OPEN
+        // can win. A concurrent/replayed pass gets zero changed rows and MUST
+        // NOT send another close message.
+        const result = this.ctx.storage.sql.exec(
+          "UPDATE gold_positions SET status='CLOSED',tp1_hit=?,tp2_hit=?,tp3_hit=?,highest_price=?,lowest_price=?,closed_at=?,close_price=?,close_reason=?,realized_points=?,peak_points=? WHERE id=? AND status='OPEN'",
           tp1, tp2, tp3, high, low, new Date().toISOString(), closePrice, reason, realizedPoints, peakPoints, positionId
         );
+        if (Number(result?.changes || 0) !== 1) {
+          this.openPositions.delete(positionId);
+          continue;
+        }
+
         pos.status = "CLOSED";
+        pos.tp1_hit = tp1; pos.tp2_hit = tp2; pos.tp3_hit = tp3;
         pos.close_price = closePrice;
         pos.close_reason = reason;
         pos.realized_points = realizedPoints;
         pos.peak_points = peakPoints;
 
-        const closeMsg = formatCloseMessage(pos, directSl, closePrice, realizedPoints, {
-          tp1: !!tp1, tp2: !!tp2, tp3: !!tp3
-        });
-        let closeSent = true;
+        // Notification state is already finalized before Telegram is touched.
+        // If Telegram returns 429/network error, we do NOT retry from every tick.
+        for (const hit of reached) await this.sendTpHit(pos, hit);
         if (pos.channel_message_id) {
-          const sent = await sendReply(this.env, closeMsg, pos.channel_message_id);
-          closeSent = !!sent;
-          if (closeSent) {
-            pos.close_notified = 1;
-            this.ctx.storage.sql.exec("UPDATE gold_positions SET close_notified=1 WHERE id=?", positionId);
-          }
+          const msg = formatCloseMessage(pos, directSl, closePrice, realizedPoints, { tp1: !!tp1, tp2: !!tp2, tp3: !!tp3 });
+          await sendReply(this.env, msg, pos.channel_message_id);
         }
-
-        // Keep the closed row in DB for reporting. Remove it from the live cache.
         this.openPositions.delete(positionId);
-        if (!closeSent) console.error("GOLD CLOSE NOTIFICATION PENDING", positionId);
-      }
-    }
-
-  }
-
-  async retryPendingClosedNotifications() {
-    // Never run two DB-backed notification recovery passes concurrently.
-    if (this.closedRetryRunning) return;
-    this.closedRetryRunning = true;
-    try {
-      // Recover at most ONE pending notification per alarm pass. This keeps
-      // Telegram traffic bounded even after an outage/rate-limit event.
-      const rows = this.ctx.storage.sql.exec(
-      "SELECT * FROM gold_positions WHERE channel_message_id IS NOT NULL AND ((status='OPEN' AND ((tp1_hit=1 AND tp1_notified=0) OR (tp2_hit=1 AND tp2_notified=0) OR (tp3_hit=1 AND tp3_notified=0))) OR (status='CLOSED' AND close_notified=0)) ORDER BY id ASC LIMIT 1"
-    ).toArray();
-    for (const row of rows) {
-      const pos = this.normalizePositionRow(row);
-
-      // Retry any TP notification that was recorded as hit but not confirmed
-      // delivered. This survives worker/Telegram failures even after the trade closes.
-      const pendingTp = [];
-      if (pos.tp1_hit && !pos.tp1_notified) pendingTp.push({ n: 1, target: Number(pos.tp1_price) });
-      if (pos.tp2_hit && !pos.tp2_notified) pendingTp.push({ n: 2, target: Number(pos.tp2_price) });
-      if (pos.tp3_hit && !pos.tp3_notified) pendingTp.push({ n: 3, target: Number(pos.tp3_price) });
-      for (const hit of pendingTp) {
-        const sent = await this.sendTpHit(pos, hit);
-        if (!sent) continue;
-        if (hit.n === 1) pos.tp1_notified = 1;
-        if (hit.n === 2) pos.tp2_notified = 1;
-        if (hit.n === 3) pos.tp3_notified = 1;
-        this.ctx.storage.sql.exec(
-          "UPDATE gold_positions SET tp1_notified=?,tp2_notified=?,tp3_notified=? WHERE id=?",
-          pos.tp1_notified, pos.tp2_notified, pos.tp3_notified, Number(pos.id)
-        );
+        continue;
       }
 
-      if (String(pos.status) === "CLOSED" && !pos.close_notified) {
-        const msg = formatCloseMessage(pos, String(pos.close_reason) === "Direct SL", Number(pos.close_price), Number(pos.realized_points || 0), {
-          tp1: !!Number(pos.tp1_hit), tp2: !!Number(pos.tp2_hit), tp3: !!Number(pos.tp3_hit)
-        });
-        const sent = await sendReply(this.env, msg, pos.channel_message_id);
-        if (sent) this.ctx.storage.sql.exec("UPDATE gold_positions SET close_notified=1 WHERE id=?", Number(pos.id));
-      }
+      // TP state is committed before Telegram send. Therefore a failed Telegram
+      // request cannot be retriggered on the next market tick.
+      this.ctx.storage.sql.exec(
+        "UPDATE gold_positions SET tp1_hit=?,tp2_hit=?,tp3_hit=?,highest_price=?,lowest_price=? WHERE id=? AND status='OPEN'",
+        tp1, tp2, tp3, high, low, positionId
+      );
+      pos.tp1_hit = tp1; pos.tp2_hit = tp2; pos.tp3_hit = tp3;
+      for (const hit of reached) await this.sendTpHit(pos, hit);
     }
-    } finally {
-      this.closedRetryRunning = false;
-    }
-  }
-
-  normalizePositionRow(row) {
-    return {
-      ...row,
-      id: Number(row.id),
-      entry_mid: Number(row.entry_mid),
-      sl_price: Number(row.sl_price),
-      tp1_price: Number(row.tp1_price),
-      tp2_price: Number(row.tp2_price),
-      tp3_price: Number(row.tp3_price),
-      tp1_hit: Number(row.tp1_hit || 0),
-      tp2_hit: Number(row.tp2_hit || 0),
-      tp3_hit: Number(row.tp3_hit || 0),
-      tp1_notified: Number(row.tp1_notified || 0),
-      tp2_notified: Number(row.tp2_notified || 0),
-      tp3_notified: Number(row.tp3_notified || 0),
-      close_notified: Number(row.close_notified || 0),
-      highest_price: Number(row.highest_price || row.entry_mid),
-      lowest_price: Number(row.lowest_price || row.entry_mid)
-    };
   }
 
   async sendTpHit(pos, hit) {
@@ -767,200 +658,97 @@ export class GoldEngine extends DurableObject {
     const heading = hit.n === 1 ? "**✅ TP1 HIT 😎**" : hit.n === 2 ? "**✅ TP2 HIT 🤩**" : "**✅ TP3 HIT 🏆**";
     const next = hit.n === 1 ? "**🎯 TP2 — Coming Soon**" : hit.n === 2 ? "**🎯 TP3 — Coming Soon**" : "**🏆 Position Still Running**";
     const msg = `${heading}\n\n**Entry:** **${fmt(entry)}**\n**Current:** **${fmt(current)}**\n**Points:** **${points >= 0 ? "+" : ""}${points.toFixed(2)}**\n\n${next}`;
-    if (!pos.channel_message_id) return true;
-    const sent = await sendReply(this.env, msg, pos.channel_message_id);
-    return !!sent;
+    if (pos.channel_message_id) await sendReply(this.env, msg, pos.channel_message_id);
   }
 
   async sendPositions(chatId) {
     const rows = this.ctx.storage.sql.exec("SELECT * FROM gold_positions WHERE status='OPEN' ORDER BY id ASC").toArray();
-    if (!rows.length) {
-      return this.sendText(chatId, `🥇 **LIVE GOLD POSITIONS**\n\n━━━━━━━━━━━━━━━━━━━━\n\n📊 **SUMMARY**\n\nOpen Positions : **0**\n\n━━━━━━━━━━━━━━━━━━━━\n\n_No open gold position right now._`);
-    }
+    if (!rows.length) return this.sendText(chatId, "**🥇 LIVE GOLD POSITIONS**\n\n_No open gold position._");
 
     const price = Number(this.lastPrice || 0);
-    const moves = rows.map(p => p.direction === "LONG" ? price - Number(p.entry_mid) : Number(p.entry_mid) - price);
-    const totalMove = moves.reduce((sum, move) => sum + move, 0);
+    const totalMove = rows.reduce((sum, p) => sum + (p.direction === "LONG" ? price - Number(p.entry_mid) : Number(p.entry_mid) - price), 0);
     const buys = rows.filter(p => p.direction === "LONG").length;
     const sells = rows.filter(p => p.direction === "SHORT").length;
-    const inProfit = moves.filter(x => x > 0).length;
-    const inLoss = moves.filter(x => x < 0).length;
-    const flat = moves.filter(x => x === 0).length;
-    const tp1Hits = rows.filter(p => Number(p.tp1_hit) === 1).length;
-    const tp2Hits = rows.filter(p => Number(p.tp2_hit) === 1).length;
-    const tp3Hits = rows.filter(p => Number(p.tp3_hit) === 1).length;
+    const tp1Hits = rows.filter(p => p.tp1_hit).length;
+    const tp2Hits = rows.filter(p => p.tp2_hit).length;
+    const tp3Hits = rows.filter(p => p.tp3_hit).length;
 
-    const summary = [
-      `🥇 **LIVE GOLD POSITIONS**`,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      ``,
-      `📊 **SUMMARY**`,
-      ``,
+    const lines = [
+      "**🥇 LIVE GOLD POSITIONS**",
+      "━━━━━━━━━━━━━━━━━━━━",
+      "**📊 SUMMARY**",
       `Open Positions : **${rows.length}**`,
-      `🟢 BUY         : **${buys}**`,
-      `🔴 SELL        : **${sells}**`,
-      ``,
-      `📈 In Profit   : **${inProfit}**`,
-      `📉 In Loss     : **${inLoss}**`,
-      `⏳ Flat        : **${flat}**`,
-      ``,
-      `💰 **TOTAL P/L : ${signedPoints(totalMove)} Points**`,
-      ``,
-      `🎯 TP1 Hit     : **${tp1Hits}**`,
-      `🎯 TP2 Hit     : **${tp2Hits}**`,
-      `🎯 TP3 Hit     : **${tp3Hits}**`,
-      ``,
-      `💵 Current     : **${fmt(price)}**`,
-      ``,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      `📌 **POSITION DETAILS**`,
-      `━━━━━━━━━━━━━━━━━━━━`
+      `🟢 BUY          : **${buys}**`,
+      `🔴 SELL         : **${sells}**`,
+      `💰 Total Move   : **${totalMove >= 0 ? "+" : ""}${totalMove.toFixed(2)} Points**`,
+      `🎯 TP1 Hits     : **${tp1Hits}**`,
+      `🎯 TP2 Hits     : **${tp2Hits}**`,
+      `🎯 TP3 Hits     : **${tp3Hits}**`,
+      `💵 Live Price   : **${fmt(price)}**`,
+      "━━━━━━━━━━━━━━━━━━━━"
     ];
-
-    const chunks = [];
-    let current = summary.slice();
-    const maxChars = 3500;
 
     for (let i = 0; i < rows.length; i++) {
       const p = rows[i];
-      const currentPrice = price;
-      const move = p.direction === "LONG" ? currentPrice - Number(p.entry_mid) : Number(p.entry_mid) - currentPrice;
-      const directionLabel = p.direction === "LONG" ? "🟢 BUY" : "🔴 SELL";
-      const block = [
-        ``,
-        `**${String(i + 1).padStart(2, "0")} ┃ ${directionLabel} GOLD — ${p.timeframe || "Gold"}**`,
-        `━━━━━━━━━━━━━━━━━━━━`,
-        ``,
-        `📅 Opened  : *${fmtDate(p.opened_at)}*`,
-        ``,
-        `📍 **Entry**   : **${fmt(p.entry_low)} – ${fmt(p.entry_high)}**`,
-        `💰 **Current** : **${fmt(currentPrice)}**`,
-        `📊 **Move**    : **${signedPoints(move)} Points**`,
-        ``,
-        `🛑 **Stop Loss** : **${fmt(p.sl_price)}**`,
-        ``,
-        `🎯 **TP1** : **${fmt(p.tp1_price)}**${p.tp1_hit ? " ✅" : ""}`,
-        `🎯 **TP2** : **${fmt(p.tp2_price)}**${p.tp2_hit ? " ✅" : ""}`,
-        `🎯 **TP3** : **${fmt(p.tp3_price)}**${p.tp3_hit ? " ✅" : ""}`,
-        ``,
-        `📊 *Setup: ${escapeMarkdown(p.setup || "Gold Setup")}*`
-      ].join("\n");
-
-      if ((current.join("\n").length + block.length + 20) > maxChars && current.length > 3) {
-        chunks.push(current.join("\n"));
-        current = [
-          `🥇 **LIVE GOLD POSITIONS — CONTINUED**`,
-          `━━━━━━━━━━━━━━━━━━━━`,
-          `📌 **POSITION DETAILS**`,
-          `━━━━━━━━━━━━━━━━━━━━`
-        ];
-      }
-      current.push(block);
+      const move = p.direction === "LONG" ? price - Number(p.entry_mid) : Number(p.entry_mid) - price;
+      lines.push(
+        `**${String(i + 1).padStart(2, "0")} ┃ ${p.direction === "LONG" ? "🟢 BUY" : "🔴 SELL"} — ${p.timeframe || "Gold"}**`,
+        `📅 *Opened:* ${fmtDate(p.opened_at)}`,
+        `📍 *Entry:* **${fmt(p.entry_low)} – ${fmt(p.entry_high)}**`,
+        `💰 *Current:* **${fmt(price)}**`,
+        `📊 *Move:* **${move >= 0 ? "+" : ""}${move.toFixed(2)} Points**`,
+        `🛑 *SL:* **${fmt(p.sl_price)}**`,
+        `🎯 *TP1:* **${fmt(p.tp1_price)}**${p.tp1_hit ? " ✅" : ""}`,
+        `🎯 *TP2:* **${fmt(p.tp2_price)}**${p.tp2_hit ? " ✅" : ""}`,
+        `🎯 *TP3:* **${fmt(p.tp3_price)}**${p.tp3_hit ? " ✅" : ""}`,
+        `📊 *Setup:* ${p.setup || "Gold Setup"}`,
+        "────────────────────"
+      );
     }
-    if (current.length) chunks.push(current.join("\n"));
-
-    for (let i = 0; i < chunks.length; i++) {
-      await this.sendText(chatId, `${chunks[i]}\n\n━━━━━━━━━━━━━━━━━━━━\n📄 *${i + 1}/${chunks.length}*`);
-    }
-    return null;
+    return this.sendText(chatId, lines.join("\n"));
   }
 
   async sendReport(chatId, days, calendarMonth = false) {
-    const now = new Date();
-    const indiaNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-    const startDate = calendarMonth
-      ? new Date(Date.UTC(indiaNow.getFullYear(), indiaNow.getMonth(), 1) - (5.5 * 60 * 60 * 1000))
-      : new Date(Date.now() - days * 86400000);
-    const start = startDate.toISOString();
-
-    // Signals are counted from signal history, while results are calculated
-    // from the positions generated by those signals. This keeps the report
-    // understandable: "signals sent" is not confused with "closed trades".
-    const signals = this.ctx.storage.sql
-      .exec("SELECT * FROM gold_signal_history WHERE sent_at >= ? ORDER BY sent_at ASC", start)
-      .toArray();
-    const positions = this.ctx.storage.sql
-      .exec("SELECT * FROM gold_positions WHERE opened_at >= ? ORDER BY opened_at ASC", start)
-      .toArray();
-
-    const totalSignals = signals.length;
-    const closed = positions.filter(p => String(p.status) === "CLOSED");
-    const running = positions.filter(p => String(p.status) === "OPEN");
-    const wins = closed.filter(p => Number(p.realized_points) > 0);
-    const losses = closed.filter(p => Number(p.realized_points) < 0);
-    const breakeven = closed.filter(p => Number(p.realized_points) === 0);
-    const grossProfit = wins.reduce((a, p) => a + Number(p.realized_points || 0), 0);
-    const grossLoss = losses.reduce((a, p) => a + Number(p.realized_points || 0), 0);
-    const net = grossProfit + grossLoss + breakeven.reduce((a, p) => a + Number(p.realized_points || 0), 0);
-    const winRate = closed.length ? (wins.length / closed.length) * 100 : 0;
-    const pending = Math.max(0, totalSignals - closed.length - running.length);
+    const start = calendarMonth
+      ? new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString()
+      : new Date(Date.now() - days * 86400000).toISOString();
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT * FROM gold_positions WHERE opened_at >= ? ORDER BY opened_at DESC", start
+    ).toArray();
+    const closed = rows.filter(r => r.status === "CLOSED" && r.closed_at);
+    const open = rows.filter(r => r.status === "OPEN");
+    const wins = closed.filter(r => Number(r.realized_points) > 0).length;
+    const losses = closed.filter(r => Number(r.realized_points) < 0).length;
+    const breakeven = closed.filter(r => Number(r.realized_points) === 0).length;
+    const net = closed.reduce((a, r) => a + Number(r.realized_points || 0), 0);
     const title = calendarMonth ? "THIS MONTH GOLD REPORT" : "LAST 7 DAYS GOLD REPORT";
-    const periodLabel = calendarMonth
-      ? `${fmtDate(startDate).split(",")[0]} – ${fmtDate(new Date()).split(",")[0]}`
-      : `${fmtDate(startDate).split(",")[0]} – ${fmtDate(new Date()).split(",")[0]}`;
-
-    const timeframeOrder = ["5M", "15M", "30M", "1H", "4H"];
-    const tfLines = timeframeOrder.map(tf => {
-      const count = signals.filter(s => String(s.timeframe) === tf).length;
-      return `${tf.padEnd(5, " ")} : **${count} Signals**`;
-    }).filter((_, i) => signals.some(s => String(s.timeframe) === timeframeOrder[i]));
+    const winRate = closed.length ? (wins / closed.length) * 100 : 0;
+    const mfe = closed.reduce((a, r) => a + Math.max(0, Number(r.peak_points || 0)), 0);
 
     const lines = [
-      `🥇 **${title}**`,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      ``,
-      `📅 **PERIOD**`,
-      `*${periodLabel}*`,
-      ``,
-      `📊 **SIGNAL SUMMARY**`,
-      ``,
-      `Total Signals : **${totalSignals}**`,
+      `**🥇 ${title}**`,
+      "━━━━━━━━━━━━━━━━━━━━",
+      "**📊 SIGNAL SUMMARY**",
+      `Total Signals : **${rows.length}**`,
       `Closed        : **${closed.length}**`,
-      `Running       : **${running.length}**`,
-      ...(pending ? [`Pending       : **${pending}**`] : []),
-      ``,
-      `🟢 Profitable : **${wins.length}**`,
-      `🔴 Losing     : **${losses.length}**`,
-      `⚪ Break-even : **${breakeven.length}**`,
-      ``,
-      `📈 **Win Rate : ${winRate.toFixed(1)}%**`,
-      ``,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      `💰 **PERFORMANCE**`,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      ``,
-      `Gross Profit : **${signedPoints(grossProfit)} Points**`,
-      `Gross Loss   : **${signedPoints(grossLoss)} Points**`,
-      ``,
-      `🏆 **NET RESULT : ${signedPoints(net)} Points**`,
-      ``,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      `🎯 **TARGET PERFORMANCE**`,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      ``,
-      `TP1 Hit : **${closed.filter(p => Number(p.tp1_hit) === 1).length}**`,
-      `TP2 Hit : **${closed.filter(p => Number(p.tp2_hit) === 1).length}**`,
-      `TP3 Hit : **${closed.filter(p => Number(p.tp3_hit) === 1).length}**`,
-      `SL Hit  : **${closed.filter(p => String(p.close_reason) === "Direct SL").length}**`,
-      `Protected/Reversal Exit : **${closed.filter(p => String(p.close_reason) === "Reversal Close").length}**`,
-      ``,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      `📊 **TIMEFRAME BREAKDOWN**`,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      ``,
-      ...(tfLines.length ? tfLines : [`No signals in this period.`]),
-      ``,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      `📌 **REPORT RESULT**`,
-      `━━━━━━━━━━━━━━━━━━━━`,
-      ``,
-      net > 0 ? `✅ *Profitable Period*` : net < 0 ? `❌ *Loss-Making Period*` : `⚪ *Break-even Period*`,
-      `📈 Net Result : **${signedPoints(net)} Points**`,
-      `📊 Win Rate   : **${winRate.toFixed(1)}%**`,
-      ``,
-      `_Closed/Running figures refer to signals generated during the selected period._`
+      `Still Open    : **${open.length}**`,
+      `🟢 Profit     : **${wins}**`,
+      `🔴 Loss       : **${losses}**`,
+      `⚪ Breakeven  : **${breakeven}**`,
+      `📈 Win Rate   : **${winRate.toFixed(1)}%**`,
+      "━━━━━━━━━━━━━━━━━━━━",
+      "**💰 PERFORMANCE**",
+      `Net P/L      : **${net >= 0 ? "+" : ""}${net.toFixed(2)} Points**`,
+      `Best MFE Sum  : **+${mfe.toFixed(2)} Points**`,
+      `🎯 TP1 Hits   : **${closed.filter(r => r.tp1_hit).length}**`,
+      `🎯 TP2 Hits   : **${closed.filter(r => r.tp2_hit).length}**`,
+      `🎯 TP3 Hits   : **${closed.filter(r => r.tp3_hit).length}**`,
+      "━━━━━━━━━━━━━━━━━━━━",
+      "**🛡️ EXIT SUMMARY**",
+      `Direct SL     : **${closed.filter(r => r.close_reason === "Direct SL").length}**`,
+      `MFE Reversal  : **${closed.filter(r => r.close_reason === "MFE Reversal").length}**`,
+      "━━━━━━━━━━━━━━━━━━━━"
     ];
-
     return this.sendText(chatId, lines.join("\n"));
   }
 
@@ -1021,7 +809,7 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   const recentHigh = Math.max(...highs.slice(-15));
   const buffer = Math.max(0.35, atrv * 0.12);
   const zoneFactor = { "5M": 0.16, "15M": 0.22, "30M": 0.26, "1H": 0.30, "4H": 0.34 }[timeframe] || 0.22;
-  const zoneWidth = clamp(atrv * zoneFactor, 0.60, 3.50);
+  const zoneWidth = clamp(atrv * zoneFactor, timeframe === "5M" ? 0.40 : 0.60, 3.50);
 
   let center = Number(setup.anchor || price);
   if (!(center > 0)) center = price;
@@ -1047,30 +835,21 @@ function buildGoldSetup(candles, price, timeframe, allCandles = {}) {
   entryHigh = Math.max(entryLow, entryHigh);
   const entryMid = (entryLow + entryHigh) / 2;
 
-  // Timeframe-aware structural SL: calculate the SL from chart structure first,
-  // then ACCEPT the setup only if the natural structural risk fits that
-  // timeframe's range. Do not artificially widen/tighten the SL.
-  // This keeps 5M scalps tight while allowing larger timeframes proportionally
-  // more room, without turning the SL into a fixed/random distance.
-  const SL_RANGES = {
-    "5M":  { min: 3, max: 5 },
-    "15M": { min: 4, max: 7 },
-    "30M": { min: 5, max: 8 },
-    "1H":  { min: 6, max: 10 },
-    "4H":  { min: 7, max: 12 }
-  };
-  const slRange = SL_RANGES[timeframe] || { min: 5, max: 8 };
-  const risk = Math.abs(entryMid - sl);
+  // Dynamic risk: structural SL first, ATR guard second.
+  let risk = Math.abs(entryMid - sl);
+  const minRiskByTf = { "5M": 4.0, "15M": 5.5, "30M": 6.0, "1H": 7.0, "4H": 8.0 };
+  const maxRiskByTf = { "5M": 7.0, "15M": 10.0, "30M": 12.0, "1H": 15.0, "4H": 18.0 };
+  const minRisk = clamp(atrv * 0.45, minRiskByTf[timeframe] || 5.5, (minRiskByTf[timeframe] || 5.5) + 2.0);
+  const maxRisk = clamp(atrv * 1.35, minRiskByTf[timeframe] || 5.5, maxRiskByTf[timeframe] || 18);
+  if (risk < minRisk || risk > maxRisk) {
+    risk = clamp(risk, minRisk, maxRisk);
+    sl = direction === "LONG" ? entryMid - risk : entryMid + risk;
+  }
+  risk = Math.abs(entryMid - sl);
+  if (!(risk >= (minRiskByTf[timeframe] || 5.5) && risk <= (maxRiskByTf[timeframe] || 18))) return null;
 
-  // If the chart's natural structural SL is outside the timeframe range,
-  // reject the setup instead of moving the SL away from the actual structure.
-  if (!(risk >= slRange.min && risk <= slRange.max)) return null;
-
-  // Fixed Gold targets: 5M = 5 / 8 / 13; 15M+ = 7 / 13 / 22.
-  const is5M = timeframe === "5M";
-  const tp1Dist = is5M ? CFG.TP1_POINTS_5M : CFG.TP1_POINTS;
-  const tp2Dist = is5M ? CFG.TP2_POINTS_5M : CFG.TP2_POINTS;
-  const tp3Dist = is5M ? CFG.TP3_POINTS_5M : CFG.TP3_POINTS;
+  // TIMEFRAME-AWARE GOLD TARGETS from Entry Mid.
+  const [tp1Dist, tp2Dist, tp3Dist] = CFG.TP_POINTS[timeframe] || CFG.TP_POINTS["15M"];
 
   const tp1 = direction === "LONG" ? entryMid + tp1Dist : entryMid - tp1Dist;
   const tp2 = direction === "LONG" ? entryMid + tp2Dist : entryMid - tp2Dist;
@@ -1255,21 +1034,7 @@ function atr(rows, p) {
 
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function fmt(v) { const n = Number(v); return Number.isFinite(n) && n > 0 ? n.toFixed(2) : "N/A"; }
-function fmtDate(v) {
-  try {
-    return new Date(v).toLocaleString("en-IN", {
-      timeZone: "Asia/Kolkata",
-      day: "numeric",
-      month: "short",
-      year: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      hour12: true
-    });
-  } catch (_) {
-    return String(v || "N/A");
-  }
-}
+function fmtDate(v) { try { return new Date(v).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }); } catch (_) { return String(v || "N/A"); } }
 
 function toCommunityPrice(okxPrice) {
   const n = Number(okxPrice);
@@ -1312,93 +1077,19 @@ function formatCloseMessage(pos, directSl, closePrice, points, hits) {
   return `**🏆 POSITION CLOSED**\n\n**Entry:** **${fmt(pos.entry_mid)}**\n**Closed:** **${fmt(closePrice)}**\n**Points:** **${points >= 0 ? "+" : ""}${points.toFixed(2)}**${tpLines.length ? `\n\n${tpLines.join("\n")}` : ""}\n\n**🔄 Next Signal — Coming Soon**`;
 }
 
-function signedPoints(v) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return "0.0";
-  return `${n >= 0 ? "+" : ""}${n.toFixed(1)}`;
-}
-
-function escapeMarkdown(v) {
-  return String(v || "").replace(/([_*`])/g, "\\$1");
-}
-
 async function sendChannel(env, text) { return tg(env, "sendMessage", { chat_id: env.CHANNEL_CHAT_ID || CFG.CHANNEL_CHAT_ID, text, disable_web_page_preview: true }); }
-async function sendReply(env, text, id) {
-  const key = `reply:${Number(id) || 0}:${String(text).slice(0, 220)}`;
-  if (telegramInFlightKeys.has(key)) return null;
-  telegramInFlightKeys.add(key);
-  try {
-    return await tg(env, "sendMessage", { chat_id: env.CHANNEL_CHAT_ID || CFG.CHANNEL_CHAT_ID, text, reply_to_message_id: Number(id), allow_sending_without_reply: true, disable_web_page_preview: true });
-  } finally {
-    telegramInFlightKeys.delete(key);
-  }
-}
-
-// Telegram safety queue: serialize outbound requests in the current Worker isolate,
-// keep a small gap between messages, and honor Telegram's retry_after on HTTP 429.
-// This prevents a burst of TP/SL/report notifications from turning into a retry storm.
-let telegramQueue = Promise.resolve();
-let telegramNextAt = 0;
-// Emergency duplicate-send guards. A notification key may be in-flight only once.
-const telegramInFlightKeys = new Set();
-
-function enqueueTelegram(task) {
-  const run = telegramQueue.then(task, task);
-  telegramQueue = run.catch(() => null);
-  return run;
-}
-
+async function sendReply(env, text, id) { return tg(env, "sendMessage", { chat_id: env.CHANNEL_CHAT_ID || CFG.CHANNEL_CHAT_ID, text, reply_to_message_id: Number(id), allow_sending_without_reply: true, disable_web_page_preview: true }); }
 async function tg(env, method, body) {
   if (!env.TELEGRAM_BOT_TOKEN) return null;
-  return enqueueTelegram(async () => {
-    const payload = method === "sendMessage"
-      ? { ...body, parse_mode: body?.parse_mode || "Markdown" }
-      : body;
-
-    const maxAttempts = 4;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        const wait = Math.max(0, telegramNextAt - Date.now());
-        if (wait > 0) await sleep(wait);
-
-        const r = await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/" + method, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-
-        const p = await r.json();
-
-        if (r.ok) {
-          // Keep messages gently spaced even when Telegram accepts them quickly.
-          telegramNextAt = Date.now() + 350;
-          return p.result || p;
-        }
-
-        if (r.status === 429) {
-          const retryAfter = Math.max(1, Number(p?.parameters?.retry_after || 3));
-          console.error("TELEGRAM RATE LIMIT", method, "retry_after=" + retryAfter + "s", "attempt=" + attempt);
-          telegramNextAt = Date.now() + retryAfter * 1000 + 250;
-          if (attempt < maxAttempts) {
-            await sleep(retryAfter * 1000 + 250);
-            continue;
-          }
-        }
-
-        console.error("TELEGRAM ERROR", method, r.status, p);
-        return null;
-      } catch (e) {
-        console.error("TELEGRAM FETCH ERROR", method, e);
-        if (attempt < maxAttempts) {
-          telegramNextAt = Date.now() + 1000;
-          await sleep(1000);
-          continue;
-        }
-        return null;
-      }
-    }
-    return null;
-  });
+  try {
+    const payload = method === "sendMessage" ? { ...body, parse_mode: body?.parse_mode || "Markdown" } : body;
+    const r = await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/" + method, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload)
+    });
+    const p = await r.json();
+    if (!r.ok) { console.error("TELEGRAM ERROR", method, r.status, p); return null; }
+    return p.result || p;
+  } catch (e) { console.error("TELEGRAM FETCH ERROR", e); return null; }
 }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function json(x) { return new Response(JSON.stringify(x), { headers: { "content-type": "application/json" } }); }
