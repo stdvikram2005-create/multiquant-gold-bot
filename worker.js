@@ -97,6 +97,11 @@ export class GoldEngine extends DurableObject {
     this.lastEvaluatedCandleTs = new Map();
     this.signalSendInFlight = false;
     this.openPositions = new Map();
+    // Position monitoring is single-flight. OKX can emit many ticks while a
+    // Telegram request is awaiting; never allow overlapping monitor passes.
+    this.monitorRunning = false;
+    this.pendingMonitorPrice = 0;
+    this.closedRetryRunning = false;
     this.initialized = false;
     this.initPromise = null;
     this.ctx.blockConcurrencyWhile(async () => { await this.init(); });
@@ -398,7 +403,9 @@ export class GoldEngine extends DurableObject {
     // Primary monitoring uses the live OKX ticker converted by -3.88.
     // The 1-minute alarm is the backup pass in case a websocket tick was missed.
     if (this.lastPrice > 0) await this.monitorPositions(this.lastPrice);
-    else await this.retryPendingClosedNotifications();
+    // Closed-position notification recovery runs only on the 1-minute backup,
+    // never on every OKX tick. This prevents retry storms and Telegram 429 floods.
+    await this.retryPendingClosedNotifications();
     // If a socket restarted after a cold DO wake, refresh history if a
     // timeframe is too short for indicators.
     for (const tf of CFG.TIMEFRAMES) {
@@ -549,6 +556,29 @@ export class GoldEngine extends DurableObject {
   async monitorPositions(price) {
     if (!(price > 0)) return;
 
+    // SINGLE-FLIGHT GUARD: live OKX ticks can arrive while Telegram awaits.
+    // Keep only the latest price and let the current pass finish first.
+    if (this.monitorRunning) {
+      this.pendingMonitorPrice = price;
+      return;
+    }
+
+    this.monitorRunning = true;
+    try {
+      let nextPrice = price;
+      for (let pass = 0; pass < 2; pass++) {
+        this.pendingMonitorPrice = 0;
+        await this._monitorPositionsOnce(nextPrice);
+        const latest = Number(this.pendingMonitorPrice || 0);
+        if (!(latest > 0) || latest === nextPrice) break;
+        nextPrice = latest;
+      }
+    } finally {
+      this.monitorRunning = false;
+    }
+  }
+
+  async _monitorPositionsOnce(price) {
     // The monitoring price is ALWAYS the live community/MT5 reference:
     // raw OKX ticker last - 3.88. Candle prices are never used here.
     if (this.openPositions.size) {
@@ -665,13 +695,14 @@ export class GoldEngine extends DurableObject {
       }
     }
 
-    // Recover any closed-position Telegram notifications that failed during the
-    // original close event. This is DB-backed, so it survives a DO restart.
-    await this.retryPendingClosedNotifications();
   }
 
   async retryPendingClosedNotifications() {
-    const rows = this.ctx.storage.sql.exec(
+    // Never run two DB-backed notification recovery passes concurrently.
+    if (this.closedRetryRunning) return;
+    this.closedRetryRunning = true;
+    try {
+      const rows = this.ctx.storage.sql.exec(
       "SELECT * FROM gold_positions WHERE status='CLOSED' AND channel_message_id IS NOT NULL AND (close_notified=0 OR (tp1_hit=1 AND tp1_notified=0) OR (tp2_hit=1 AND tp2_notified=0) OR (tp3_hit=1 AND tp3_notified=0)) ORDER BY id ASC LIMIT 10"
     ).toArray();
     for (const row of rows) {
@@ -702,6 +733,9 @@ export class GoldEngine extends DurableObject {
         const sent = await sendReply(this.env, msg, pos.channel_message_id);
         if (sent) this.ctx.storage.sql.exec("UPDATE gold_positions SET close_notified=1 WHERE id=?", Number(pos.id));
       }
+    }
+    } finally {
+      this.closedRetryRunning = false;
     }
   }
 
