@@ -89,8 +89,8 @@ export class GoldEngine extends DurableObject {
     this.reconnectTimer = null;
     this.candles = {};
     for (const tf of CFG.TIMEFRAMES) this.candles[tf.key] = [];
-    this.lastPrice = 0; // community/MT5 reference price (OKX - 3.88) used by monitoring
-    this.lastOkxPrice = 0; // raw OKX XAU price used by strategy
+    this.lastPrice = 0; // raw OKX XAU price used by strategy/monitoring
+    this.lastOkxPrice = 0;
     this.lastTickerTs = 0;
     this.monitorInFlight = false;
     this.pendingMonitorPrice = 0;
@@ -98,6 +98,7 @@ export class GoldEngine extends DurableObject {
     this.signalLocks = new Map();
     this.lastEvaluatedCandleTs = new Map();
     this.signalSendInFlight = false;
+    this.notificationLocks = new Set();
     this.openPositions = new Map();
     this.initialized = false;
     this.initPromise = null;
@@ -109,7 +110,6 @@ export class GoldEngine extends DurableObject {
     if (this.initPromise) return this.initPromise;
     this.initPromise = (async () => {
       await this.ensureSchema();
-      await this.migratePriceScale();
       await this.loadState();
       await this.loadOpenPositionsCache();
       await this.bootstrapAllTimeframes();
@@ -170,29 +170,19 @@ export class GoldEngine extends DurableObject {
     sql.exec(`CREATE TABLE IF NOT EXISTS gold_meta (key TEXT PRIMARY KEY, value TEXT);`);
     sql.exec(`CREATE TABLE IF NOT EXISTS gold_candle_evaluations (timeframe TEXT NOT NULL, candle_ts INTEGER NOT NULL, evaluated_at TEXT NOT NULL, PRIMARY KEY(timeframe, candle_ts));`);
     sql.exec(`CREATE TABLE IF NOT EXISTS gold_notification_events (event_key TEXT PRIMARY KEY, sent_at TEXT NOT NULL);`);
-  }
 
-  async migratePriceScale() {
-    // The previous deployed version stored positions/history on raw OKX scale
-    // and converted them again when displaying/monitoring. Convert the existing
-    // database exactly once to the community/MT5 scale. Future rows are stored
-    // in community scale directly.
-    const marker = this.ctx.storage.sql.exec("SELECT value FROM gold_meta WHERE key='priceScaleVersion' LIMIT 1").one();
-    if (String(marker?.value || "") === "community-v1") return;
-    const off = Number(CFG.GOLD_PRICE_OFFSET);
-    if (!Number.isFinite(off) || off === 0) {
-      await this.saveMeta("priceScaleVersion", "community-v1");
-      return;
+    // Price-scale migration: all persisted position prices are now COMMUNITY/MT5 scale.
+    // The old Gold build stored raw OKX prices, so convert them exactly once.
+    const scaleRow = sql.exec("SELECT value FROM gold_meta WHERE key='positionPriceScale' LIMIT 1").toArray()[0];
+    if (String(scaleRow?.value || "") !== "community-v1") {
+      const offset = Number(CFG.GOLD_PRICE_OFFSET);
+      sql.exec(
+        "UPDATE gold_positions SET entry_low=entry_low+?, entry_high=entry_high+?, entry_mid=entry_mid+?, sl_price=sl_price+?, tp1_price=tp1_price+?, tp2_price=tp2_price+?, tp3_price=tp3_price+?, highest_price=CASE WHEN highest_price IS NULL THEN NULL ELSE highest_price+? END, lowest_price=CASE WHEN lowest_price IS NULL THEN NULL ELSE lowest_price+? END, close_price=CASE WHEN close_price IS NULL THEN NULL ELSE close_price+? END",
+        offset, offset, offset, offset, offset, offset, offset, offset, offset, offset
+      );
+      sql.exec("UPDATE gold_signal_history SET entry_mid=entry_mid+?, sl_price=sl_price+?, tp1_price=tp1_price+?, tp2_price=tp2_price+?, tp3_price=tp3_price+?", offset, offset, offset, offset, offset);
+      sql.exec("INSERT OR REPLACE INTO gold_meta(key,value) VALUES('positionPriceScale','community-v1')");
     }
-    const cols = ["entry_low","entry_high","entry_mid","sl_price","tp1_price","tp2_price","tp3_price","highest_price","lowest_price","close_price"];
-    for (const col of cols) {
-      try { this.ctx.storage.sql.exec(`UPDATE gold_positions SET ${col}=${col}+? WHERE ${col} IS NOT NULL`, off); } catch (_) {}
-    }
-    for (const col of ["entry_mid","sl_price","tp1_price","tp2_price","tp3_price"]) {
-      try { this.ctx.storage.sql.exec(`UPDATE gold_signal_history SET ${col}=${col}+?`, off); } catch (_) {}
-    }
-    await this.saveMeta("priceScaleVersion", "community-v1");
-    console.log("GOLD PRICE SCALE MIGRATED", JSON.stringify({ version: "community-v1", offset: off }));
   }
 
   async loadState() {
@@ -355,10 +345,10 @@ export class GoldEngine extends DurableObject {
       const price = Number(x.last);
       if (price > 0) {
         this.lastOkxPrice = price;
-        const communityPrice = toCommunityPrice(price);
-        this.lastPrice = communityPrice;
+        this.lastPrice = toCommunityPrice(price);
         this.lastTickerTs = Number(x.ts || Date.now());
-        this.requestPositionMonitor(communityPrice).catch(e => console.error("GOLD MONITOR ERROR", e));
+        // Position monitoring always runs on the community/MT5 price scale.
+        this.requestPositionMonitor(this.lastPrice).catch(e => console.error("GOLD MONITOR ERROR", e));
       }
     }
   }
@@ -513,37 +503,44 @@ export class GoldEngine extends DurableObject {
     }
 
     try {
-      // Strategy stays on raw OKX scale. Convert exactly once at the boundary and
-      // store the position in community/MT5 scale from this point onward.
-      const communitySetup = toCommunitySetup(setup);
-      const text = formatSignal(communitySetup);
+      const text = formatSignal(setup);
       const sent = await sendChannel(this.env, text);
       if (!sent?.message_id) return null;
 
       this.lastSignalKey = key;
       await this.saveMeta("lastSignalKey", key);
+      const stored = {
+        entryLow: toCommunityPrice(setup.entryLow),
+        entryHigh: toCommunityPrice(setup.entryHigh),
+        entryMid: toCommunityPrice(setup.entryMid),
+        slPrice: toCommunityPrice(setup.slPrice),
+        tp1Price: toCommunityPrice(setup.tp1Price),
+        tp2Price: toCommunityPrice(setup.tp2Price),
+        tp3Price: toCommunityPrice(setup.tp3Price)
+      };
+
       this.ctx.storage.sql.exec(`INSERT INTO gold_signal_history(symbol,direction,entry_mid,sl_price,tp1_price,tp2_price,tp3_price,setup,timeframe,candle_ts,signal_key,sent_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-        CFG.OKX_INST_ID, communitySetup.direction, communitySetup.entryMid, communitySetup.slPrice, communitySetup.tp1Price, communitySetup.tp2Price, communitySetup.tp3Price,
-        communitySetup.setup, communitySetup.timeframe, candleTs, key, new Date().toISOString());
+        CFG.OKX_INST_ID, setup.direction, stored.entryMid, stored.slPrice, stored.tp1Price, stored.tp2Price, stored.tp3Price,
+        setup.setup, setup.timeframe, candleTs, key, new Date().toISOString());
 
       this.ctx.storage.sql.exec(`INSERT INTO gold_positions(symbol,direction,entry_low,entry_high,entry_mid,sl_price,tp1_price,tp2_price,tp3_price,highest_price,lowest_price,status,channel_message_id,setup,timeframe,opened_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        CFG.OKX_INST_ID, communitySetup.direction, communitySetup.entryLow, communitySetup.entryHigh, communitySetup.entryMid, communitySetup.slPrice, communitySetup.tp1Price, communitySetup.tp2Price, communitySetup.tp3Price,
-        communitySetup.entryMid, communitySetup.entryMid, "OPEN", Number(sent.message_id), communitySetup.setup, communitySetup.timeframe, new Date().toISOString());
+        CFG.OKX_INST_ID, setup.direction, stored.entryLow, stored.entryHigh, stored.entryMid, stored.slPrice, stored.tp1Price, stored.tp2Price, stored.tp3Price,
+        stored.entryMid, stored.entryMid, "OPEN", Number(sent.message_id), setup.setup, setup.timeframe, new Date().toISOString());
       const inserted = this.ctx.storage.sql.exec("SELECT last_insert_rowid() AS id").one();
       const positionId = Number(inserted?.id || 0);
       if (positionId) {
         this.openPositions.set(positionId, {
-          id: positionId, symbol: CFG.OKX_INST_ID, direction: communitySetup.direction,
-          entry_low: communitySetup.entryLow, entry_high: communitySetup.entryHigh, entry_mid: communitySetup.entryMid,
-          sl_price: communitySetup.slPrice, tp1_price: communitySetup.tp1Price, tp2_price: communitySetup.tp2Price, tp3_price: communitySetup.tp3Price,
-          tp1_hit: 0, tp2_hit: 0, tp3_hit: 0, highest_price: communitySetup.entryMid, lowest_price: communitySetup.entryMid,
-          status: "OPEN", channel_message_id: Number(sent.message_id), setup: communitySetup.setup, timeframe: communitySetup.timeframe,
+          id: positionId, symbol: CFG.OKX_INST_ID, direction: setup.direction,
+          entry_low: stored.entryLow, entry_high: stored.entryHigh, entry_mid: stored.entryMid,
+          sl_price: stored.slPrice, tp1_price: stored.tp1Price, tp2_price: stored.tp2Price, tp3_price: stored.tp3Price,
+          tp1_hit: 0, tp2_hit: 0, tp3_hit: 0, highest_price: stored.entryMid, lowest_price: stored.entryMid,
+          status: "OPEN", channel_message_id: Number(sent.message_id), setup: setup.setup, timeframe: setup.timeframe,
           opened_at: new Date().toISOString()
         });
       }
 
-      console.log("GOLD SIGNAL SENT", JSON.stringify({ timeframe: communitySetup.timeframe, direction: communitySetup.direction, setup: communitySetup.setup, entry: communitySetup.entry, sl: communitySetup.sl, tp1: communitySetup.tp1, tp2: communitySetup.tp2, tp3: communitySetup.tp3, score: communitySetup.score }));
-      return communitySetup;
+      console.log("GOLD SIGNAL SENT", JSON.stringify({ timeframe: setup.timeframe, direction: setup.direction, setup: setup.setup, entry: setup.entry, sl: setup.sl, tp1: setup.tp1, tp2: setup.tp2, tp3: setup.tp3, score: setup.score }));
+      return setup;
     } finally {
       this.signalLocks.delete(timeframe);
       if (!force) this.signalSendInFlight = false;
@@ -676,33 +673,26 @@ export class GoldEngine extends DurableObject {
   }
 
   async sendReplyOnce(eventKey, text, id) {
-    const exists = this.ctx.storage.sql.exec("SELECT event_key FROM gold_notification_events WHERE event_key=? LIMIT 1", eventKey).one();
-    if (exists) return null;
+    if (this.notificationLocks.has(eventKey)) return null;
+    this.notificationLocks.add(eventKey);
+    try {
+      const rows = this.ctx.storage.sql.exec(
+        "SELECT event_key FROM gold_notification_events WHERE event_key=? LIMIT 1",
+        eventKey
+      ).toArray();
+      if (rows.length) return null;
 
-    // Reserve the event before awaiting Telegram so concurrent ticks cannot send
-    // the same notification twice. If Telegram fails, remove the reservation and
-    // make one plain-message fallback attempt.
-    const reserved = this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO gold_notification_events(event_key,sent_at) VALUES(?,?)",
-      eventKey, new Date().toISOString()
-    );
-    if (!reserved || Number(reserved.changes || 0) !== 1) return null;
-
-    const reply = await sendReply(this.env, text, id);
-    if (reply) {
-      console.log("GOLD REPLY SENT", eventKey);
-      return reply;
+      const sent = await sendReply(this.env, text, id);
+      if (sent?.message_id) {
+        this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO gold_notification_events(event_key,sent_at) VALUES(?,?)",
+          eventKey, new Date().toISOString()
+        );
+      }
+      return sent;
+    } finally {
+      this.notificationLocks.delete(eventKey);
     }
-
-    console.error("GOLD REPLY FAILED - FALLBACK", eventKey, id);
-    const fallback = await sendChannel(this.env, text);
-    if (fallback?.message_id) {
-      console.log("GOLD FALLBACK NOTIFICATION SENT", JSON.stringify({ eventKey, messageId: fallback.message_id }));
-      return fallback;
-    }
-
-    this.ctx.storage.sql.exec("DELETE FROM gold_notification_events WHERE event_key=?", eventKey);
-    return null;
   }
 
   async sendPositions(chatId) {
@@ -710,7 +700,7 @@ export class GoldEngine extends DurableObject {
     if (!rows.length) return this.sendText(chatId, "🥇 LIVE GOLD POSITIONS\n\nNo open gold position.");
 
     const chunks = [];
-    const price = Number(this.lastPrice || toCommunityPrice(this.lastOkxPrice) || 0);
+    const price = Number(this.lastPrice || 0);
     const totalMove = rows.reduce((sum, p) => {
       const move = p.direction === "LONG" ? price - Number(p.entry_mid) : Number(p.entry_mid) - price;
       return sum + move;
@@ -1097,27 +1087,13 @@ function toCommunityPrice(okxPrice) {
   return Number.isFinite(n) && n > 0 ? n + Number(CFG.GOLD_PRICE_OFFSET) : n;
 }
 
-function toCommunitySetup(s) {
-  const convert = v => toCommunityPrice(v);
-  return {
-    ...s,
-    entryLow: convert(s.entryLow),
-    entryHigh: convert(s.entryHigh),
-    entryMid: convert(s.entryMid),
-    slPrice: convert(s.slPrice),
-    tp1Price: convert(s.tp1Price),
-    tp2Price: convert(s.tp2Price),
-    tp3Price: convert(s.tp3Price)
-  };
-}
-
 function formatSignal(s) {
-  const entryLow = Number(s.entryLow);
-  const entryHigh = Number(s.entryHigh);
-  const sl = Number(s.slPrice);
-  const tp1 = Number(s.tp1Price);
-  const tp2 = Number(s.tp2Price);
-  const tp3 = Number(s.tp3Price);
+  const entryLow = toCommunityPrice(s.entryLow);
+  const entryHigh = toCommunityPrice(s.entryHigh);
+  const sl = toCommunityPrice(s.slPrice);
+  const tp1 = toCommunityPrice(s.tp1Price);
+  const tp2 = toCommunityPrice(s.tp2Price);
+  const tp3 = toCommunityPrice(s.tp3Price);
   return `**🥇 GOLD (XAUUSD) SIGNAL**\n\n${s.direction === "LONG" ? "**🟢 ══ 📈 𝗕𝗨𝗬 ══**" : "**🔴 ══ 📉 𝗦𝗘𝗟𝗟 ══**"}\n\n📍 **Entry Zone:** **${fmt(entryLow)} — ${fmt(entryHigh)}**\n\n🎯 **TP1:** **${fmt(tp1)}**\n\n🎯 **TP2:** **${fmt(tp2)}**\n\n🎯 **TP3:** **${fmt(tp3)}**\n\n🛑 **Stop Loss:** **${fmt(sl)}**\n\n📊 *Setup: ${s.setup} — ${s.timeframe}*\n\n*Move your SL to entry after the 1st TP is hit.*\n\n#XAUUSD #Gold #GoldSignal #Forex #Trading`;
 }
 
