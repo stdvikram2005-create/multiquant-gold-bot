@@ -169,6 +169,17 @@ export class GoldEngine extends DurableObject {
     sql.exec(`CREATE TABLE IF NOT EXISTS gold_meta (key TEXT PRIMARY KEY, value TEXT);`);
     sql.exec(`CREATE TABLE IF NOT EXISTS gold_candle_evaluations (timeframe TEXT NOT NULL, candle_ts INTEGER NOT NULL, evaluated_at TEXT NOT NULL, PRIMARY KEY(timeframe, candle_ts));`);
     sql.exec(`CREATE TABLE IF NOT EXISTS gold_notification_events (event_key TEXT PRIMARY KEY, sent_at TEXT NOT NULL);`);
+    // Failed Telegram replies stay pending and are retried with a hard cap.
+    // This prevents the old "mark SENT before Telegram" bug without creating a blast loop.
+    sql.exec(`CREATE TABLE IF NOT EXISTS gold_notification_pending (
+      event_key TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      reply_to_message_id INTEGER NOT NULL,
+      text TEXT NOT NULL,
+      attempts INTEGER DEFAULT 0,
+      next_attempt_at INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );`);
   }
 
   async loadState() {
@@ -552,7 +563,13 @@ export class GoldEngine extends DurableObject {
   }
 
   async monitorPositions(price) {
-    if (!(price > 0) || !this.openPositions.size) return;
+    if (!(price > 0)) return;
+
+    // Retry only previously failed Telegram replies. The queue is bounded per
+    // event and each event has a hard retry cap, so a Telegram/API outage
+    // cannot turn into a message blast.
+    await this.flushPendingNotifications();
+    if (!this.openPositions.size) return;
 
     for (const [positionId, pos] of Array.from(this.openPositions.entries())) {
       if (pos.status !== "OPEN") continue;
@@ -578,6 +595,7 @@ export class GoldEngine extends DurableObject {
         if (n === 2) tp2 = 1;
         if (n === 3) tp3 = 1;
         reached.push({ n, target });
+        console.log("GOLD TP HIT DETECTED", JSON.stringify({ positionId, timeframe: pos.timeframe, direction, tp: n, target, price }));
       }
 
       // MFE protection: activates after +5 favorable points. TP1 is NOT required.
@@ -648,10 +666,73 @@ export class GoldEngine extends DurableObject {
   }
 
   async sendReplyOnce(eventKey, text, id) {
-    const exists = this.ctx.storage.sql.exec("SELECT event_key FROM gold_notification_events WHERE event_key=? LIMIT 1", eventKey).one();
-    if (exists) return null;
-    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO gold_notification_events(event_key,sent_at) VALUES(?,?)", eventKey, new Date().toISOString());
-    return sendReply(this.env, text, id);
+    if (!id) return null;
+
+    const sent = this.ctx.storage.sql.exec(
+      "SELECT event_key FROM gold_notification_events WHERE event_key=? LIMIT 1",
+      eventKey
+    ).one();
+    if (sent) return null;
+
+    // Create one pending record first. If Telegram fails, the record remains
+    // pending and is retried later. If Telegram succeeds, only then is the
+    // event marked SENT. This fixes the previous lost-reply bug.
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO gold_notification_pending(event_key,chat_id,reply_to_message_id,text,attempts,next_attempt_at,created_at) VALUES(?,?,?,?,0,?,?)",
+      eventKey,
+      this.env.CHANNEL_CHAT_ID || CFG.CHANNEL_CHAT_ID,
+      Number(id),
+      String(text),
+      Date.now(),
+      new Date().toISOString()
+    );
+
+    await this.flushPendingNotifications(eventKey);
+    const ok = this.ctx.storage.sql.exec(
+      "SELECT event_key FROM gold_notification_events WHERE event_key=? LIMIT 1",
+      eventKey
+    ).one();
+    return ok ? { ok: true } : null;
+  }
+
+  async flushPendingNotifications(onlyEventKey = "") {
+    const now = Date.now();
+    const rows = onlyEventKey
+      ? this.ctx.storage.sql.exec(
+          "SELECT * FROM gold_notification_pending WHERE event_key=? AND next_attempt_at<=? LIMIT 1",
+          onlyEventKey, now
+        ).toArray()
+      : this.ctx.storage.sql.exec(
+          "SELECT * FROM gold_notification_pending WHERE next_attempt_at<=? AND attempts<3 ORDER BY created_at ASC LIMIT 5",
+          now
+        ).toArray();
+
+    for (const row of rows) {
+      const attempts = Number(row.attempts || 0);
+      if (attempts >= 3) continue;
+
+      this.ctx.storage.sql.exec(
+        "UPDATE gold_notification_pending SET attempts=?,next_attempt_at=? WHERE event_key=?",
+        attempts + 1,
+        now + 15000,
+        row.event_key
+      );
+
+      console.log("GOLD TELEGRAM REPLY ATTEMPT", JSON.stringify({ eventKey: row.event_key, attempt: attempts + 1 }));
+      const result = await sendReply(this.env, row.text, Number(row.reply_to_message_id));
+
+      if (result) {
+        this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO gold_notification_events(event_key,sent_at) VALUES(?,?)",
+          row.event_key, new Date().toISOString()
+        );
+        this.ctx.storage.sql.exec("DELETE FROM gold_notification_pending WHERE event_key=?", row.event_key);
+        console.log("GOLD TELEGRAM REPLY SENT", row.event_key);
+      } else if (attempts + 1 >= 3) {
+        console.error("GOLD TELEGRAM REPLY FAILED AFTER 3 ATTEMPTS", row.event_key);
+        this.ctx.storage.sql.exec("DELETE FROM gold_notification_pending WHERE event_key=?", row.event_key);
+      }
+    }
   }
 
   async sendPositions(chatId) {
