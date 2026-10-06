@@ -648,27 +648,30 @@ export class GoldEngine extends DurableObject {
   }
 
   async sendReplyOnce(eventKey, text, id) {
-    const exists = this.ctx.storage.sql.exec("SELECT event_key FROM gold_notification_events WHERE event_key=? LIMIT 1", eventKey).one();
-    if (exists) return null;
-
-    // Telegram must succeed BEFORE the event is permanently consumed.
-    // If Telegram fails, leave the event unconsumed so a later tick can retry.
+    // Hard idempotency guard: never allow the same event to be sent twice.
+    // Mark BEFORE sending so a Telegram timeout/error cannot create a retry/blast loop.
     try {
-      const sent = await sendReply(this.env, text, id);
-      if (!sent) {
-        console.error("GOLD TELEGRAM REPLY FAILED", JSON.stringify({ eventKey, replyTo: Number(id) }));
-        return null;
-      }
+      const exists = this.ctx.storage.sql
+        .exec("SELECT event_key FROM gold_notification_events WHERE event_key=? LIMIT 1", eventKey)
+        .one();
+      if (exists) return null;
 
       this.ctx.storage.sql.exec(
         "INSERT OR IGNORE INTO gold_notification_events(event_key,sent_at) VALUES(?,?)",
         eventKey,
         new Date().toISOString()
       );
-      console.log("GOLD TELEGRAM REPLY SENT", JSON.stringify({ eventKey, replyTo: Number(id) }));
-      return sent;
+
+      const result = await sendReply(this.env, text, id);
+      if (result) {
+        console.log("GOLD TELEGRAM REPLY SENT", JSON.stringify({ eventKey, replyTo: Number(id) }));
+      } else {
+        console.error("GOLD TELEGRAM REPLY FAILED", JSON.stringify({ eventKey, replyTo: Number(id) }));
+      }
+      return result;
     } catch (e) {
-      console.error("GOLD TELEGRAM REPLY ERROR", e);
+      // Never let a notification failure crash monitorPositions.
+      console.error("GOLD REPLY ERROR", eventKey, e);
       return null;
     }
   }
