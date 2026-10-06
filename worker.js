@@ -648,14 +648,18 @@ export class GoldEngine extends DurableObject {
   }
 
   async sendReplyOnce(eventKey, text, id) {
-    // Hard idempotency guard: never allow the same event to be sent twice.
-    // Mark BEFORE sending so a Telegram timeout/error cannot create a retry/blast loop.
-    try {
-      const exists = this.ctx.storage.sql
-        .exec("SELECT event_key FROM gold_notification_events WHERE event_key=? LIMIT 1", eventKey)
-        .one();
-      if (exists) return null;
+    // Idempotent notification guard. Use toArray() instead of .one():
+    // .one() can throw when the event does not exist, which was stopping
+    // the monitor before the Telegram reply was sent.
+    if (!eventKey || !id) return null;
 
+    try {
+      const rows = this.ctx.storage.sql
+        .exec("SELECT event_key FROM gold_notification_events WHERE event_key=? LIMIT 1", eventKey)
+        .toArray();
+      if (rows.length) return null;
+
+      // Claim before send to prevent concurrent duplicate replies.
       this.ctx.storage.sql.exec(
         "INSERT OR IGNORE INTO gold_notification_events(event_key,sent_at) VALUES(?,?)",
         eventKey,
@@ -663,15 +667,26 @@ export class GoldEngine extends DurableObject {
       );
 
       const result = await sendReply(this.env, text, id);
-      if (result) {
-        console.log("GOLD TELEGRAM REPLY SENT", JSON.stringify({ eventKey, replyTo: Number(id) }));
-      } else {
-        console.error("GOLD TELEGRAM REPLY FAILED", JSON.stringify({ eventKey, replyTo: Number(id) }));
+      if (!result) {
+        // Telegram did not confirm success, so release the claim.
+        this.ctx.storage.sql.exec(
+          "DELETE FROM gold_notification_events WHERE event_key=?",
+          eventKey
+        );
+        console.error("GOLD REPLY TELEGRAM FAILED", eventKey);
+        return null;
       }
+
+      console.log("GOLD REPLY SENT", eventKey);
       return result;
     } catch (e) {
-      // Never let a notification failure crash monitorPositions.
-      console.error("GOLD REPLY ERROR", eventKey, e);
+      try {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM gold_notification_events WHERE event_key=?",
+          eventKey
+        );
+      } catch (_) {}
+      console.error("GOLD REPLY ERROR", eventKey, e && e.message ? e.message : e);
       return null;
     }
   }
@@ -1093,7 +1108,14 @@ async function tg(env, method, body) {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body)
     });
     const p = await r.json();
-    if (!r.ok) { console.error("TELEGRAM ERROR", method, r.status, p); return null; }
+    if (!r.ok) {
+      console.error("TELEGRAM ERROR", method, r.status, JSON.stringify(p));
+      return null;
+    }
+    if (!p || p.ok !== true) {
+      console.error("TELEGRAM BAD RESPONSE", method, JSON.stringify(p));
+      return null;
+    }
     return p.result || p;
   } catch (e) { console.error("TELEGRAM FETCH ERROR", e); return null; }
 }
